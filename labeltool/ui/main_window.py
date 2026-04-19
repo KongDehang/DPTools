@@ -190,6 +190,8 @@ class AnnotationMainWindow(QMainWindow):
         self._thumbnail_min_icon_width = 84
         self._thumbnail_max_icon_width = 256
         self._thumbnail_zoom_step = 10
+        self._thumbnail_refresh_pending = False
+        self._statistics_refresh_pending = False
         self._dataset_scan_thread: QThread | None = None
         self._dataset_scan_worker: DatasetScanWorker | None = None
         self._thumbnail_thread: QThread | None = None
@@ -1805,7 +1807,7 @@ class AnnotationMainWindow(QMainWindow):
         self._pending_dataset_preferred_path = preferred_path
         self._dataset_loading = True
         self._set_loaded_state(False)
-        self.dataset_statistics_widget.set_loading("正在统计数据...")
+        self._set_statistics_loading_state("正在统计数据...")
         self._set_status_message(f"正在加载数据集: {root}")
 
         worker = DatasetScanWorker(root, dict(self.class_manager.id_to_name))
@@ -1911,7 +1913,9 @@ class AnnotationMainWindow(QMainWindow):
     def _extract_merge_split_name(self, relative_path: Path) -> str | None:
         for part in relative_path.parts:
             lowered = part.strip().lower()
-            if lowered in {"train", "val", "test"}:
+            if lowered in {"val", "valid"}:
+                return "val"
+            if lowered in {"train", "test"}:
                 return lowered
         return None
 
@@ -1919,7 +1923,7 @@ class AnnotationMainWindow(QMainWindow):
         tokens: list[str] = []
         for part in relative_parent.parts:
             lowered = part.strip().lower()
-            if lowered in {"train", "val", "test"}:
+            if lowered in {"train", "val", "valid", "test"}:
                 tokens.append("{split}")
             else:
                 tokens.append(lowered)
@@ -2038,18 +2042,22 @@ class AnnotationMainWindow(QMainWindow):
         output_root: Path,
         class_mapping: dict[int, str],
         split_mode: bool,
+        *,
+        train_path: str | None = None,
+        val_path: str | None = None,
+        test_path: str | None = None,
     ) -> None:
         lines: list[str] = []
         if split_mode:
             lines.extend([
-                "train: images/train",
-                "val: images/val",
-                "test: images/test",
+                f"train: {train_path or 'images/train'}",
+                f"val: {val_path or 'images/val'}",
+                f"test: {test_path or 'images/test'}",
             ])
         else:
             lines.extend([
-                "train: images",
-                "val: images",
+                f"train: {train_path or 'images'}",
+                f"val: {val_path or 'images'}",
             ])
 
         lines.append("")
@@ -2128,13 +2136,104 @@ class AnnotationMainWindow(QMainWindow):
             counts[class_id] = counts.get(class_id, 0) + 1
         return counts
 
-    def _collect_split_dataset_items(
+    def _resolve_extract_split_layout(
         self,
         source_root: Path,
+        splits: tuple[str, ...],
+    ) -> tuple[str | None, dict[str, tuple[Path, Path]], str | None]:
+        split_aliases: dict[str, tuple[str, ...]] = {}
+        for split_name in splits:
+            if split_name == "val":
+                split_aliases[split_name] = ("val", "valid")
+            else:
+                split_aliases[split_name] = (split_name,)
+
+        resolved_layouts: dict[str, dict[str, tuple[Path, Path]]] = {}
+        for mode in ("images_split", "split_nested"):
+            mapping: dict[str, tuple[Path, Path]] = {}
+            mode_ok = True
+            for split_name in splits:
+                aliases = split_aliases.get(split_name, (split_name,))
+                selected_pair: tuple[Path, Path] | None = None
+                for alias in aliases:
+                    if mode == "images_split":
+                        image_dir = source_root / "images" / alias
+                        label_dir = source_root / "labels" / alias
+                    else:
+                        image_dir = source_root / alias / "images"
+                        label_dir = source_root / alias / "labels"
+                    if image_dir.exists() and image_dir.is_dir() and label_dir.exists() and label_dir.is_dir():
+                        selected_pair = (image_dir, label_dir)
+                        break
+                if selected_pair is None:
+                    mode_ok = False
+                    break
+                mapping[split_name] = selected_pair
+            if mode_ok:
+                resolved_layouts[mode] = mapping
+
+        if not resolved_layouts:
+            missing_a = [
+                (
+                    "images/val(或valid) + labels/val(或valid)"
+                    if split_name == "val"
+                    else f"images/{split_name} + labels/{split_name}"
+                )
+                for split_name in splits
+            ]
+            missing_b = [
+                (
+                    "val(或valid)/images + val(或valid)/labels"
+                    if split_name == "val"
+                    else f"{split_name}/images + {split_name}/labels"
+                )
+                for split_name in splits
+            ]
+            detail = (
+                "未匹配到以下任一结构：\n"
+                f"1) {'；'.join(missing_a)}\n"
+                f"2) {'；'.join(missing_b)}"
+            )
+            return None, {}, detail
+
+        selected_mode = "images_split" if "images_split" in resolved_layouts else next(iter(resolved_layouts))
+        return selected_mode, resolved_layouts[selected_mode], None
+
+    def _extract_layout_caption(self, mode: str) -> str:
+        if mode == "split_nested":
+            return "train/images + train/labels"
+        return "images/train + labels/train"
+
+    def _build_extract_output_paths(
+        self,
+        output_root: Path,
         split_name: str,
+        relative_path: Path,
+        layout_mode: str,
+    ) -> tuple[Path, Path]:
+        if layout_mode == "split_nested":
+            image_output = output_root / split_name / "images" / relative_path
+            label_output = (output_root / split_name / "labels" / relative_path).with_suffix(".txt")
+            return image_output, label_output
+
+        image_output = output_root / "images" / split_name / relative_path
+        label_output = (output_root / "labels" / split_name / relative_path).with_suffix(".txt")
+        return image_output, label_output
+
+    def _prepare_extract_output_dirs(self, output_root: Path, splits: tuple[str, ...], layout_mode: str) -> None:
+        for split_name in splits:
+            if layout_mode == "split_nested":
+                (output_root / split_name / "images").mkdir(parents=True, exist_ok=True)
+                (output_root / split_name / "labels").mkdir(parents=True, exist_ok=True)
+            else:
+                (output_root / "images" / split_name).mkdir(parents=True, exist_ok=True)
+                (output_root / "labels" / split_name).mkdir(parents=True, exist_ok=True)
+
+    def _collect_split_dataset_items(
+        self,
+        images_dir: Path,
+        labels_dir: Path,
     ) -> tuple[list[ExtractDatasetItem], dict[int, int]]:
-        images_dir = source_root / "images" / split_name
-        labels_dir = source_root / "labels" / split_name
         items: list[ExtractDatasetItem] = []
         class_totals: dict[int, int] = {}
 
@@ -2244,19 +2343,12 @@ class AnnotationMainWindow(QMainWindow):
 
         source_root = Path(source_root_text)
         splits = ("train", "val", "test")
-        required_dirs = [
-            source_root / "images" / split_name
-            for split_name in splits
-        ] + [
-            source_root / "labels" / split_name
-            for split_name in splits
-        ]
-        missing = [str(path.relative_to(source_root)) for path in required_dirs if not path.exists()]
-        if missing:
+        layout_mode, split_dirs, layout_error = self._resolve_extract_split_layout(source_root, splits)
+        if layout_mode is None:
             self._warning_dialog(
                 "结构不完整",
-                "抽取功能仅支持已划分数据集（images/labels 下包含 train、val、test）。",
-                informative_text="缺失目录：" + "，".join(missing[:8]),
+                "抽取功能仅支持已划分数据集。",
+                informative_text=layout_error or "请检查目录结构。",
                 details=str(source_root),
             )
             return
@@ -2295,12 +2387,17 @@ class AnnotationMainWindow(QMainWindow):
         source_items: dict[str, list[ExtractDatasetItem]] = {}
         source_class_totals: dict[str, dict[int, int]] = {}
         for split_name in splits:
-            items, class_totals = self._collect_split_dataset_items(source_root, split_name)
+            image_dir, label_dir = split_dirs[split_name]
+            items, class_totals = self._collect_split_dataset_items(image_dir, label_dir)
             if not items:
                 self._warning_dialog(
                     "分级为空",
                     f"{split_name} 未发现可抽取图片。",
-                    informative_text=f"请检查 images/{split_name} 目录。",
+                    informative_text=(
+                        f"请检查目录：{image_dir.relative_to(source_root)}"
+                        if image_dir.is_relative_to(source_root)
+                        else f"请检查目录：{image_dir}"
+                    ),
                     details=str(source_root),
                 )
                 return
@@ -2321,9 +2418,7 @@ class AnnotationMainWindow(QMainWindow):
             self._info_dialog("抽取结果", "没有可抽取的样本。")
             return
 
-        for split_name in splits:
-            (output_root / "images" / split_name).mkdir(parents=True, exist_ok=True)
-            (output_root / "labels" / split_name).mkdir(parents=True, exist_ok=True)
+        self._prepare_extract_output_dirs(output_root, splits, layout_mode)
 
         copied = 0
         copied_items: dict[str, list[ExtractDatasetItem]] = {split_name: [] for split_name in splits}
@@ -2343,12 +2438,16 @@ class AnnotationMainWindow(QMainWindow):
                     cancelled = True
                     break
 
-                output_image_path = output_root / "images" / split_name / item.relative_path
+                output_image_path, output_label_path = self._build_extract_output_paths(
+                    output_root,
+                    split_name,
+                    item.relative_path,
+                    layout_mode,
+                )
                 output_image_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(item.image_path, output_image_path)
 
                 if item.label_path is not None and item.label_path.exists():
-                    output_label_path = (output_root / "labels" / split_name / item.relative_path).with_suffix(".txt")
                     output_label_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(item.label_path, output_label_path)
 
@@ -2371,11 +2470,25 @@ class AnnotationMainWindow(QMainWindow):
             for split_name in splits:
                 observed_ids.update(source_class_totals[split_name].keys())
             class_mapping = {class_id: f"ID {class_id}" for class_id in sorted(observed_ids)}
-        self._write_merge_data_yaml(output_root, class_mapping, split_mode=True)
+
+        if layout_mode == "split_nested":
+            train_path, val_path, test_path = "train/images", "val/images", "test/images"
+        else:
+            train_path, val_path, test_path = "images/train", "images/val", "images/test"
+
+        self._write_merge_data_yaml(
+            output_root,
+            class_mapping,
+            split_mode=True,
+            train_path=train_path,
+            val_path=val_path,
+            test_path=test_path,
+        )
 
         details_lines = [
             f"源目录：{source_root}",
             f"输出目录：{output_root}",
+            f"识别结构：{self._extract_layout_caption(layout_mode)}",
             f"抽取比例：{ratio_percent}%",
             f"随机种子：{random_seed}",
             "",
@@ -2712,9 +2825,15 @@ class AnnotationMainWindow(QMainWindow):
                         self.image_list_widget.setCurrentRow(row)
                         break
 
-    def _refresh_thumbnail_list(self) -> None:
+    def _refresh_thumbnail_list(self, *, force: bool = False) -> None:
         if not hasattr(self, "thumbnail_list_widget"):
             return
+
+        if not force and not self._is_thumbnail_panel_visible():
+            self._thumbnail_refresh_pending = True
+            return
+
+        self._thumbnail_refresh_pending = False
 
         visible_paths: list[Path] = []
         self.thumbnail_list_widget.setUpdatesEnabled(False)
@@ -2736,6 +2855,17 @@ class AnnotationMainWindow(QMainWindow):
         self._sync_thumbnail_selection()
         self._start_thumbnail_loading(visible_paths)
 
+    def _cancel_thumbnail_loading(self) -> None:
+        worker = self._thumbnail_worker
+        thread = self._thumbnail_thread
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if thread is not None and thread.isRunning():
+            thread.quit()
+
     def _thumbnail_icon_placeholder(self) -> QPixmap:
         size = self._thumbnail_dimensions()
         placeholder = QPixmap(size)
@@ -2743,6 +2873,7 @@ class AnnotationMainWindow(QMainWindow):
         return placeholder
 
     def _start_thumbnail_loading(self, visible_paths: list[Path]) -> None:
+        self._cancel_thumbnail_loading()
         self._thumbnail_job_generation += 1
         job_id = self._thumbnail_job_generation
 
@@ -2766,6 +2897,8 @@ class AnnotationMainWindow(QMainWindow):
     def _on_thumbnail_ready(self, job_id: int, index: int, thumbnail_image) -> None:
         if job_id != self._thumbnail_job_generation:
             return
+        if not self._is_thumbnail_panel_visible():
+            return
         if index < 0 or index >= len(self._thumbnail_visible_paths):
             return
         path = self._thumbnail_visible_paths[index]
@@ -2779,16 +2912,22 @@ class AnnotationMainWindow(QMainWindow):
     def _on_thumbnail_progress(self, job_id: int, current: int, total: int) -> None:
         if job_id != self._thumbnail_job_generation:
             return
+        if not self._is_thumbnail_panel_visible():
+            return
         self.status_zoom_label.setText(f"缩放 {int(round(self.current_zoom_scale * 100))}% | 缩略图 {current}/{total}")
 
     def _on_thumbnail_finished(self, job_id: int) -> None:
         if job_id != self._thumbnail_job_generation:
             return
+        self._thumbnail_worker = None
+        self._thumbnail_thread = None
         self._update_status_bar_values()
 
     def _on_thumbnail_failed(self, job_id: int, message: str) -> None:
         if job_id != self._thumbnail_job_generation:
             return
+        self._thumbnail_worker = None
+        self._thumbnail_thread = None
         self._set_status_message(f"缩略图加载失败：{message}")
 
     def on_thumbnail_item_clicked(self, item: QListWidgetItem) -> None:
@@ -3624,9 +3763,15 @@ class AnnotationMainWindow(QMainWindow):
         annotated = box_count > 0
         return counts, box_count, annotated
 
-    def _update_dataset_statistics_widget(self) -> None:
+    def _update_dataset_statistics_widget(self, *, force: bool = False) -> None:
         if not hasattr(self, "dataset_statistics_widget"):
             return
+
+        if not force and not self._is_statistics_panel_visible():
+            self._statistics_refresh_pending = True
+            return
+
+        self._statistics_refresh_pending = False
 
         self.dataset_statistics_widget.set_class_mapping(dict(self.class_manager.name_to_id))
         counts = dict(self._dataset_stats_baseline_counts)
@@ -3667,6 +3812,14 @@ class AnnotationMainWindow(QMainWindow):
         self._current_document_saved_counts = counts
         self._current_document_saved_box_count = box_count
         self._current_document_saved_is_annotated = annotated
+
+    def _set_statistics_loading_state(self, text: str) -> None:
+        if not hasattr(self, "dataset_statistics_widget"):
+            return
+        if not self._is_statistics_panel_visible():
+            self._statistics_refresh_pending = True
+            return
+        self.dataset_statistics_widget.set_loading(text)
 
     def _on_dataset_scan_progress(self, job_id: int, current: int, total: int) -> None:
         if job_id != self._dataset_job_generation:
@@ -3717,7 +3870,7 @@ class AnnotationMainWindow(QMainWindow):
             return
         self._dataset_loading = False
         self._set_loaded_state(bool(self.dataset_service.image_paths))
-        self.dataset_statistics_widget.set_loading("数据加载失败")
+        self._set_statistics_loading_state("数据加载失败")
         self._set_status_message(f"数据集加载失败：{message}")
 
     def _sync_history_actions(self) -> None:
@@ -4981,9 +5134,25 @@ class AnnotationMainWindow(QMainWindow):
         self.sidebar_dock.setVisible(visible)
         self._status_bar().showMessage("控制台已显示" if visible else "控制台已隐藏", 1200)
 
+    def _is_thumbnail_panel_visible(self) -> bool:
+        return self.thumbnail_dock is not None and self.thumbnail_dock.isVisible()
+
+    def _is_statistics_panel_visible(self) -> bool:
+        return self.statistics_dock is not None and self.statistics_dock.isVisible()
+
+    def _flush_deferred_panel_refresh(self) -> None:
+        if self._is_thumbnail_panel_visible() and self._thumbnail_refresh_pending:
+            self._refresh_thumbnail_list(force=True)
+        if self._is_statistics_panel_visible() and self._statistics_refresh_pending:
+            self._update_dataset_statistics_widget(force=True)
+
     def _on_dock_visibility_changed(self, _visible: bool) -> None:
+        if self.thumbnail_dock is not None and not self.thumbnail_dock.isVisible():
+            self._thumbnail_refresh_pending = True
+            self._cancel_thumbnail_loading()
         # Delay to next event loop turn so Qt finalizes dock visibility first.
         QTimer.singleShot(0, self._refresh_dock_layout)
+        QTimer.singleShot(0, self._flush_deferred_panel_refresh)
 
     def _refresh_dock_layout(self) -> None:
         if self.sidebar_dock is None or self.thumbnail_dock is None or self.statistics_dock is None:

@@ -105,6 +105,10 @@ class ThumbnailLoadWorker(QObject):
         super().__init__()
         self.image_paths = list(image_paths)
         self.thumbnail_size = thumbnail_size
+        self._cancel_requested = False
+
+    def stop(self) -> None:
+        self._cancel_requested = True
 
     def run(self) -> None:
         try:
@@ -115,6 +119,8 @@ class ThumbnailLoadWorker(QObject):
 
             thumb_width, thumb_height = self.thumbnail_size
             for index, image_path in enumerate(self.image_paths):
+                if self._cancel_requested:
+                    break
                 if not image_path.exists():
                     continue
                 try:
@@ -122,6 +128,8 @@ class ThumbnailLoadWorker(QObject):
                     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
                     if image is None:
                         continue
+                    if self._cancel_requested:
+                        break
                     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     height, width = rgb.shape[:2]
                     qimage = QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888).copy()
@@ -131,6 +139,8 @@ class ThumbnailLoadWorker(QObject):
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.FastTransformation,
                     )
+                    if self._cancel_requested:
+                        break
                     self.thumbnailReady.emit(index, thumbnail)
                 except Exception:
                     continue
