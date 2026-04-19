@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>数据集划分工具</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    
+    <!-- 配置Tailwind自定义颜色和字体 -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3B82F6',
+                        secondary: '#10B981',
+                        accent: '#6366F1',
+                        neutral: '#1F2937',
+                        'neutral-light': '#F3F4F6',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .slider-thumb {
+                @apply appearance-none w-5 h-5 rounded-full bg-primary cursor-pointer;
+            }
+            .progress-bar {
+                @apply h-2 bg-gray-200 rounded-full overflow-hidden;
+            }
+            .progress-value {
+                @apply h-full bg-secondary transition-all duration-300 ease-out;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans">
+    <div class="container mx-auto px-4 py-8 max-w-4xl">
+        <!-- 标题区域 -->
+        <header class="text-center mb-10">
+            <h1 class="text-[clamp(1.8rem,4vw,2.5rem)] font-bold text-neutral mb-2">
+                <i class="fa fa-cubes text-primary mr-3"></i>数据集划分工具
+            </h1>
+            <p class="text-gray-600 max-w-2xl mx-auto">
+                按照指定比例将图像文件和对应的标注文件分配到训练集、测试集和验证集文件夹中
+            </p>
+        </header>
+        
+        <!-- 主要内容区域 -->
+        <main class="bg-white rounded-xl shadow-lg p-6 md:p-8 mb-8">
+            <!-- 划分模式选择 -->
+            <div class="mb-6">
+                <div class="flex space-x-4 border-b border-gray-200">
+                    <button id="mode-ratio" class="py-2 px-4 border-b-2 border-primary font-medium text-primary focus:outline-none transition-colors">
+                        <i class="fa fa-percent mr-2"></i>按比例划分
+                    </button>
+                    <button id="mode-count" class="py-2 px-4 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 focus:outline-none transition-colors">
+                        <i class="fa fa-list-ol mr-2"></i>按数量划分
+                    </button>
+                </div>
+            </div>
+
+            <!-- 比例设置区域 -->
+            <section id="ratio-settings" class="mb-8">
+                <h2 class="text-xl font-semibold text-neutral mb-4 flex items-center">
+                    <i class="fa fa-sliders text-primary mr-2"></i>划分比例设置
+                </h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <!-- 训练集比例 -->
+                    <div class="space-y-2">
+                        <label for="train-ratio" class="block text-sm font-medium text-gray-700">
+                            训练集比例: <span id="train-value" class="font-bold text-primary">7.0</span>/10
+                        </label>
+                        <input 
+                            type="range" 
+                            id="train-ratio" 
+                            min="0" 
+                            max="10" 
+                            step="0.1"
+                            value="7.0" 
+                            class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary"
+                        >
+                    </div>
+                    
+                    <!-- 测试集比例 -->
+                    <div class="space-y-2">
+                        <label for="test-ratio" class="block text-sm font-medium text-gray-700">
+                            测试集比例: <span id="test-value" class="font-bold text-primary">2.0</span>/10
+                        </label>
+                        <input 
+                            type="range" 
+                            id="test-ratio" 
+                            min="0" 
+                            max="10" 
+                            step="0.1"
+                            value="2.0" 
+                            class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary"
+                        >
+                    </div>
+                    
+                    <!-- 验证集比例 -->
+                    <div class="space-y-2">
+                        <label for="valid-ratio" class="block text-sm font-medium text-gray-700">
+                            验证集比例: <span id="valid-value" class="font-bold text-primary">1.0</span>/10
+                        </label>
+                        <input 
+                            type="range" 
+                            id="valid-ratio" 
+                            min="0" 
+                            max="10" 
+                            step="0.1"
+                            value="1.0" 
+                            class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary"
+                        >
+                    </div>
+                </div>
+                
+                <div id="ratio-error" class="mt-3 text-red-500 text-sm hidden">
+                    <i class="fa fa-exclamation-circle mr-1"></i>比例总和必须为10.0
+                </div>
+                
+                <div class="mt-4 text-center">
+                    <span class="inline-block px-3 py-1 bg-neutral-light rounded-full text-sm text-gray-600">
+                        总比例: <span id="total-ratio" class="font-bold">10.0</span>/10
+                    </span>
+                </div>
+            </section>
+
+            <!-- 数量设置区域 (默认隐藏) -->
+            <section id="count-settings" class="mb-8 hidden">
+                <h2 class="text-xl font-semibold text-neutral mb-4 flex items-center">
+                    <i class="fa fa-sort-numeric-asc text-primary mr-2"></i>划分数量设置
+                </h2>
+                
+                <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0">
+                            <i class="fa fa-info-circle text-blue-500"></i>
+                        </div>
+                        <div class="ml-3">
+                            <p class="text-sm text-blue-700">
+                                当前源目录下共找到 <span id="total-files-count" class="font-bold text-lg">0</span> 组图像文件。
+                                <span id="scan-status" class="text-xs text-gray-500 ml-2">(请先选择源目录)</span>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <!-- 训练集数量 -->
+                    <div class="space-y-2">
+                        <label for="train-count" class="block text-sm font-medium text-gray-700">
+                            训练集数量
+                        </label>
+                        <input 
+                            type="number" 
+                            id="train-count" 
+                            min="0" 
+                            value="0" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                    </div>
+                    
+                    <!-- 测试集数量 -->
+                    <div class="space-y-2">
+                        <label for="test-count" class="block text-sm font-medium text-gray-700">
+                            测试集数量
+                        </label>
+                        <input 
+                            type="number" 
+                            id="test-count" 
+                            min="0" 
+                            value="0" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                    </div>
+                    
+                    <!-- 验证集数量 -->
+                    <div class="space-y-2">
+                        <label for="valid-count" class="block text-sm font-medium text-gray-700">
+                            验证集数量
+                        </label>
+                        <input 
+                            type="number" 
+                            id="valid-count" 
+                            min="0" 
+                            value="0" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                    </div>
+                </div>
+                
+                <div id="count-error" class="mt-3 text-red-500 text-sm hidden">
+                    <i class="fa fa-exclamation-circle mr-1"></i>数量总和 (<span id="current-total-count">0</span>) 超过了可用文件总数 (<span id="max-total-count">0</span>)
+                </div>
+                
+                <div class="mt-4 text-center">
+                    <span class="inline-block px-3 py-1 bg-neutral-light rounded-full text-sm text-gray-600">
+                        剩余未分配: <span id="remaining-count" class="font-bold">0</span>
+                    </span>
+                </div>
+            </section>
+            
+            <!-- 文件夹选择区域 -->
+            <section class="mb-8">
+                <h2 class="text-xl font-semibold text-neutral mb-4 flex items-center">
+                    <i class="fa fa-folder-open text-primary mr-2"></i>文件路径设置
+                </h2>
+                <div class="space-y-4">
+                    <div>
+                        <label for="source-path" class="block text-sm font-medium text-gray-700 mb-1">
+                            源文件目录
+                        </label>
+                        <div class="flex">
+                            <input 
+                                type="text" 
+                                id="source-path" 
+                                placeholder="未选择文件夹" 
+                                class="flex-1 px-4 py-2 border border-gray-300 rounded-l-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                                readonly
+                            >
+                            <button 
+                                id="select-source" 
+                                class="bg-primary hover:bg-primary/90 text-white px-4 py-2 rounded-r-lg transition-colors duration-200"
+                            >
+                                <i class="fa fa-search mr-1"></i>选择
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">
+                            包含图像文件和标注文件的文件夹
+                        </p>
+                    </div>
+                    
+                    <div>
+                        <label for="dest-path" class="block text-sm font-medium text-gray-700 mb-1">
+                            目标目录
+                        </label>
+                        <div class="flex">
+                            <input 
+                                type="text" 
+                                id="dest-path" 
+                                placeholder="未选择文件夹" 
+                                class="flex-1 px-4 py-2 border border-gray-300 rounded-l-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                                readonly
+                            >
+                            <button 
+                                id="select-dest" 
+                                class="bg-primary hover:bg-primary/90 text-white px-4 py-2 rounded-r-lg transition-colors duration-200"
+                            >
+                                <i class="fa fa-search mr-1"></i>选择
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">
+                            生成train、test、valid文件夹的位置
+                        </p>
+                    </div>
+                    
+                    <!-- 子文件夹选项 -->
+                    <div class="mt-2">
+                        <label class="inline-flex items-center">
+                            <input type="checkbox" id="enable-subfolders" class="rounded text-primary focus:ring-primary">
+                            <span class="ml-2 text-sm text-gray-700">创建images和labels子文件夹</span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- 文件类型设置 -->
+            <section class="mb-8">
+                <h2 class="text-xl font-semibold text-neutral mb-4 flex items-center">
+                    <i class="fa fa-file-text text-primary mr-2"></i>文件类型设置
+                </h2>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label for="image-extensions" class="block text-sm font-medium text-gray-700 mb-1">
+                            图像文件扩展名
+                        </label>
+                        <input 
+                            type="text" 
+                            id="image-extensions" 
+                            value="jpg,jpeg,png,bmp,tiff,raw" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                        <p class="text-xs text-gray-500 mt-1">
+                            用逗号分隔，例如: jpg,png
+                        </p>
+                    </div>
+                    
+                    <div>
+                        <label for="label-extensions" class="block text-sm font-medium text-gray-700 mb-1">
+                            标注文件扩展名
+                        </label>
+                        <input 
+                            type="text" 
+                            id="label-extensions" 
+                            value="xml,txt,json" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                        <p class="text-xs text-gray-500 mt-1">
+                            用逗号分隔，例如: xml,txt
+                        </p>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- 随机划分选项 -->
+            <section class="mb-8">
+                <div class="bg-gray-50 p-4 rounded-lg">
+                    <label class="inline-flex items-center">
+                        <input type="checkbox" id="enable-random" class="rounded text-primary focus:ring-primary" checked>
+                        <span class="ml-2 text-sm text-gray-700">启用随机划分</span>
+                    </label>
+                    <p class="text-xs text-gray-500 mt-1 ml-6">
+                        勾选则随机打乱文件顺序后划分，不勾选则按文件原有顺序依次分配到训练集、验证集和测试集
+                    </p>
+                </div>
+            </section>
+            
+            <!-- 操作按钮 -->
+            <section class="text-center mb-6">
+                <button 
+                    id="start-split" 
+                    class="bg-secondary hover:bg-secondary/90 text-white font-medium px-8 py-3 rounded-lg shadow-md hover:shadow-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled
+                >
+                    <i class="fa fa-random mr-2"></i>开始划分数据集
+                </button>
+            </section>
+            
+            <!-- 进度显示区域 -->
+            <section id="progress-section" class="hidden">
+                <h2 class="text-xl font-semibold text-neutral mb-4 flex items-center">
+                    <i class="fa fa-spinner fa-spin text-primary mr-2"></i>处理进度
+                </h2>
+                
+                <div class="progress-bar mb-2">
+                    <div id="progress-bar" class="progress-value" style="width: 0%"></div>
+                </div>
+                
+                <div class="flex justify-between text-sm text-gray-600 mb-4">
+                    <span id="progress-text">准备开始...</span>
+                    <span id="progress-percentage">0%</span>
+                </div>
+                
+                <div id="log-container" class="bg-gray-50 p-4 rounded-lg h-40 overflow-y-auto text-sm text-gray-700 mb-4">
+                    <!-- 日志内容将在这里显示 -->
+                </div>
+            </section>
+            
+            <!-- 结果显示区域 -->
+            <section id="result-section" class="hidden">
+                <div id="success-message" class="bg-green-50 border border-green-200 text-green-700 p-4 rounded-lg mb-4 hidden">
+                    <h3 class="font-medium flex items-center">
+                        <i class="fa fa-check-circle mr-2"></i>划分成功
+                    </h3>
+                    <p class="mt-1 text-sm">数据集已成功划分为以下几个部分：</p>
+                    <ul id="result-details" class="mt-2 list-disc list-inside text-sm">
+                        <!-- 结果详情将在这里显示 -->
+                    </ul>
+                </div>
+                
+                <div id="error-message" class="bg-red-50 border border-red-200 text-red-700 p-4 rounded-lg mb-4 hidden">
+                    <h3 class="font-medium flex items-center">
+                        <i class="fa fa-exclamation-circle mr-2"></i>操作失败
+                    </h3>
+                    <p id="error-details" class="mt-1 text-sm">发生错误，请查看日志了解详情。</p>
+                </div>
+                
+                <div class="text-center">
+                    <button 
+                        id="reset-button" 
+                        class="bg-gray-200 hover:bg-gray-300 text-gray-800 font-medium px-6 py-2 rounded-lg transition-colors duration-200"
+                    >
+                        <i class="fa fa-refresh mr-1"></i>重新开始
+                    </button>
+                </div>
+            </section>
+        </main>
+        
+        <!-- 页脚 -->
+        <footer class="text-center text-gray-500 text-sm">
+            <p>数据集划分工具 &copy; 2025  Author@KDH</p>
+        </footer>
+    </div>
+
+    <script>
+        // DOM元素引用
+        const modeRatioBtn = document.getElementById('mode-ratio');
+        const modeCountBtn = document.getElementById('mode-count');
+        const ratioSettings = document.getElementById('ratio-settings');
+        const countSettings = document.getElementById('count-settings');
+        
+        const trainRatio = document.getElementById('train-ratio');
+        const testRatio = document.getElementById('test-ratio');
+        const validRatio = document.getElementById('valid-ratio');
+        const trainValue = document.getElementById('train-value');
+        const testValue = document.getElementById('test-value');
+        const validValue = document.getElementById('valid-value');
+        const totalRatio = document.getElementById('total-ratio');
+        const ratioError = document.getElementById('ratio-error');
+        
+        const trainCountInput = document.getElementById('train-count');
+        const testCountInput = document.getElementById('test-count');
+        const validCountInput = document.getElementById('valid-count');
+        const totalFilesCount = document.getElementById('total-files-count');
+        const scanStatus = document.getElementById('scan-status');
+        const countError = document.getElementById('count-error');
+        const currentTotalCount = document.getElementById('current-total-count');
+        const maxTotalCount = document.getElementById('max-total-count');
+        const remainingCount = document.getElementById('remaining-count');
+        
+        const sourcePath = document.getElementById('source-path');
+        const destPath = document.getElementById('dest-path');
+        const selectSource = document.getElementById('select-source');
+        const selectDest = document.getElementById('select-dest');
+        const enableSubfolders = document.getElementById('enable-subfolders');
+        const enableRandom = document.getElementById('enable-random');
+        const imageExtensions = document.getElementById('image-extensions');
+        const labelExtensions = document.getElementById('label-extensions');
+        const startSplit = document.getElementById('start-split');
+        const progressSection = document.getElementById('progress-section');
+        const progressBar = document.getElementById('progress-bar');
+        const progressText = document.getElementById('progress-text');
+        const progressPercentage = document.getElementById('progress-percentage');
+        const logContainer = document.getElementById('log-container');
+        const resultSection = document.getElementById('result-section');
+        const successMessage = document.getElementById('success-message');
+        const errorMessage = document.getElementById('error-message');
+        const resultDetails = document.getElementById('result-details');
+        const resetButton = document.getElementById('reset-button');
+        const errorDetails = document.getElementById('error-details');
+        
+        // 状态变量
+        let sourceDirHandle = null;
+        let destDirHandle = null;
+        let splitMode = 'ratio'; // 'ratio' or 'count'
+        let allFilePairs = []; // 缓存扫描到的文件对
+        
+        // 切换模式
+        function setMode(mode) {
+            splitMode = mode;
+            if (mode === 'ratio') {
+                modeRatioBtn.classList.add('border-primary', 'text-primary');
+                modeRatioBtn.classList.remove('border-transparent', 'text-gray-500');
+                modeCountBtn.classList.remove('border-primary', 'text-primary');
+                modeCountBtn.classList.add('border-transparent', 'text-gray-500');
+                
+                ratioSettings.classList.remove('hidden');
+                countSettings.classList.add('hidden');
+                updateRatioDisplay();
+            } else {
+                modeCountBtn.classList.add('border-primary', 'text-primary');
+                modeCountBtn.classList.remove('border-transparent', 'text-gray-500');
+                modeRatioBtn.classList.remove('border-primary', 'text-primary');
+                modeRatioBtn.classList.add('border-transparent', 'text-gray-500');
+                
+                countSettings.classList.remove('hidden');
+                ratioSettings.classList.add('hidden');
+                updateCountDisplay();
+            }
+        }
+        
+        // 更新比例显示
+        function updateRatioDisplay() {
+            const train = parseFloat(trainRatio.value);
+            const test = parseFloat(testRatio.value);
+            const valid = parseFloat(validRatio.value);
+            const total = train + test + valid;
+            
+            trainValue.textContent = train.toFixed(1);
+            testValue.textContent = test.toFixed(1);
+            validValue.textContent = valid.toFixed(1);
+            totalRatio.textContent = total.toFixed(1);
+            
+            const isTotalValid = Math.abs(total - 10.0) < 0.01;
+            
+            if (!isTotalValid) {
+                ratioError.classList.remove('hidden');
+                startSplit.disabled = true;
+            } else {
+                ratioError.classList.add('hidden');
+                checkStartButton();
+            }
+        }
+        
+        // 更新数量显示
+        function updateCountDisplay() {
+            const train = parseInt(trainCountInput.value) || 0;
+            const test = parseInt(testCountInput.value) || 0;
+            const valid = parseInt(validCountInput.value) || 0;
+            const total = train + test + valid;
+            const maxFiles = allFilePairs.length;
+            
+            currentTotalCount.textContent = total;
+            maxTotalCount.textContent = maxFiles;
+            remainingCount.textContent = Math.max(0, maxFiles - total);
+            
+            if (total > maxFiles) {
+                countError.classList.remove('hidden');
+                startSplit.disabled = true;
+            } else if (total === 0 && maxFiles > 0) {
+                // 还没设置数量
+                countError.classList.add('hidden');
+                startSplit.disabled = true;
+            } else {
+                countError.classList.add('hidden');
+                checkStartButton();
+            }
+        }
+        
+        // 检查开始按钮状态
+        function checkStartButton() {
+            if (!sourceDirHandle || !destDirHandle) {
+                startSplit.disabled = true;
+                return;
+            }
+            
+            if (splitMode === 'ratio') {
+                const total = parseFloat(totalRatio.textContent);
+                startSplit.disabled = Math.abs(total - 10.0) >= 0.01;
+            } else {
+                const total = parseInt(currentTotalCount.textContent);
+                const max = parseInt(maxTotalCount.textContent);
+                startSplit.disabled = total > max || total === 0;
+            }
+        }
+        
+        // 扫描源目录
+        async function scanSourceDirectory() {
+            if (!sourceDirHandle) return;
+            
+            scanStatus.textContent = "(正在扫描...)";
+            totalFilesCount.textContent = "...";
+            
+            try {
+                const imageExts = imageExtensions.value.split(',').map(ext => ext.trim()).filter(ext => ext);
+                const labelExts = labelExtensions.value.split(',').map(ext => ext.trim()).filter(ext => ext);
+                
+                allFilePairs = await getFilePairs(sourceDirHandle, imageExts, labelExts, false); // false = 不记录日志
+                
+                totalFilesCount.textContent = allFilePairs.length;
+                scanStatus.textContent = "";
+                
+                // 更新数量输入框的最大值建议
+                // 默认分配: 70% train, 20% test, 10% valid
+                if (parseInt(trainCountInput.value) === 0 && parseInt(testCountInput.value) === 0) {
+                    const total = allFilePairs.length;
+                    trainCountInput.value = Math.floor(total * 0.7);
+                    testCountInput.value = Math.floor(total * 0.2);
+                    validCountInput.value = total - Math.floor(total * 0.7) - Math.floor(total * 0.2);
+                }
+                
+                updateCountDisplay();
+                
+            } catch (err) {
+                console.error("扫描目录失败:", err);
+                scanStatus.textContent = "(扫描失败)";
+                totalFilesCount.textContent = "0";
+            }
+        }
+        
+        // 日志输出函数
+        function log(message) {
+            const logEntry = document.createElement('div');
+            logEntry.className = 'mb-1 border-b border-gray-100 pb-1 last:border-0 last:mb-0 last:pb-0';
+            logEntry.innerHTML = `<span class="text-gray-500">[${new Date().toLocaleTimeString()}]</span> ${message}`;
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+        
+        // 更新进度条
+        function updateProgress(percent, text) {
+            progressBar.style.width = `${percent}%`;
+            progressPercentage.textContent = `${percent.toFixed(1)}%`;
+            progressText.textContent = text;
+            log(text);
+        }
+        
+        // 选择文件夹
+        async function selectDirectory(inputElement) {
+            try {
+                const dirHandle = await window.showDirectoryPicker({
+                    mode: 'readwrite'
+                });
+                inputElement.value = dirHandle.name;
+                return dirHandle;
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    alert('选择文件夹时出错: ' + err.message);
+                }
+                return null;
+            }
+        }
+        
+        // 获取所有图像文件和对应的标注文件
+        async function getFilePairs(sourceDir, imageExts, labelExts, enableLog = true) {
+            const imageExtensionsSet = new Set(imageExts.map(ext => ext.toLowerCase()));
+            const labelExtensionsSet = new Set(labelExts.map(ext => ext.toLowerCase()));
+            
+            const filePairs = [];
+            const imageFiles = new Map();
+            
+            // 收集图像
+            for await (const entry of sourceDir.values()) {
+                if (entry.kind !== 'file') continue;
+                const nameParts = entry.name.split('.');
+                if (nameParts.length < 2) continue;
+                const ext = nameParts.pop().toLowerCase();
+                const baseName = nameParts.join('.');
+                
+                if (imageExtensionsSet.has(ext)) {
+                    imageFiles.set(baseName, { image: entry, label: null });
+                }
+            }
+            
+            // 匹配标注
+            for await (const entry of sourceDir.values()) {
+                if (entry.kind !== 'file') continue;
+                const nameParts = entry.name.split('.');
+                if (nameParts.length < 2) continue;
+                const ext = nameParts.pop().toLowerCase();
+                const baseName = nameParts.join('.');
+                
+                if (labelExtensionsSet.has(ext) && imageFiles.has(baseName)) {
+                    const pair = imageFiles.get(baseName);
+                    pair.label = entry;
+                    imageFiles.set(baseName, pair);
+                }
+            }
+            
+            // 过滤并按文件名排序
+            const sortedPairs = Array.from(imageFiles.values())
+                .filter(pair => pair.label)
+                .sort((a, b) => a.image.name.localeCompare(b.image.name, undefined, { numeric: true, sensitivity: 'base' }));
+            
+            // 处理未找到标注的图像
+            if (enableLog) {
+                Array.from(imageFiles.values())
+                    .filter(pair => !pair.label)
+                    .forEach(pair => log(`警告: 未找到图像 ${pair.image.name} 的标注文件`));
+            }
+            
+            return sortedPairs;
+        }
+        
+        // 随机打乱数组
+        function shuffleArray(array) {
+            const newArray = [...array];
+            for (let i = newArray.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
+            }
+            return newArray;
+        }
+        
+        // 创建目录
+        async function ensureDirectoryExists(parentDir, dirName) {
+            try {
+                return await parentDir.getDirectoryHandle(dirName, { create: true });
+            } catch (err) {
+                throw new Error(`创建目录 ${dirName} 失败: ${err.message}`);
+            }
+        }
+        
+        // 复制文件
+        async function copyFile(srcFile, destDir, fileName) {
+            try {
+                try {
+                    const existingFile = await destDir.getFileHandle(fileName);
+                    await existingFile.remove();
+                } catch (err) {}
+                
+                const destFile = await destDir.getFileHandle(fileName, { create: true });
+                const writable = await destFile.createWritable();
+                const file = await srcFile.getFile();
+                await writable.write(await file.arrayBuffer());
+                await writable.close();
+                return true;
+            } catch (err) {
+                throw new Error(`复制文件 ${fileName} 失败: ${err.message}`);
+            }
+        }
+        
+        // 执行数据集划分
+        async function splitDataset() {
+            try {
+                progressSection.classList.remove('hidden');
+                resultSection.classList.add('hidden');
+                logContainer.innerHTML = '';
+                updateProgress(0, '开始准备数据集划分...');
+                
+                const useSubfolders = enableSubfolders.checked;
+                const useRandom = enableRandom.checked;
+                
+                // 如果没有缓存文件，先扫描
+                if (allFilePairs.length === 0) {
+                    updateProgress(5, '正在扫描文件...');
+                    const imageExts = imageExtensions.value.split(',').map(ext => ext.trim()).filter(ext => ext);
+                    const labelExts = labelExtensions.value.split(',').map(ext => ext.trim()).filter(ext => ext);
+                    allFilePairs = await getFilePairs(sourceDirHandle, imageExts, labelExts, true);
+                }
+                
+                if (allFilePairs.length === 0) {
+                    throw new Error('未找到匹配的图像和标注文件对');
+                }
+                
+                log(`共找到 ${allFilePairs.length} 组匹配文件`);
+                
+                // 根据随机选项决定是否打乱文件顺序
+                let filePairsToProcess = [...allFilePairs];
+                if (useRandom) {
+                    updateProgress(10, '正在随机排序文件...');
+                    filePairsToProcess = shuffleArray(filePairsToProcess);
+                } else {
+                    updateProgress(10, '使用文件原有顺序...');
+                }
+                
+                // 计算数量
+                let trainCount, testCount, validCount;
+                
+                if (splitMode === 'ratio') {
+                    const train = parseFloat(trainRatio.value);
+                    const test = parseFloat(testRatio.value);
+                    const valid = parseFloat(validRatio.value);
+                    const totalRatioSum = train + test + valid;
+                    const totalFiles = filePairsToProcess.length;
+                    
+                    trainCount = Math.round((train / totalRatioSum) * totalFiles);
+                    testCount = Math.round((test / totalRatioSum) * totalFiles);
+                    validCount = totalFiles - trainCount - testCount;
+                } else {
+                    trainCount = parseInt(trainCountInput.value) || 0;
+                    testCount = parseInt(testCountInput.value) || 0;
+                    validCount = parseInt(validCountInput.value) || 0;
+                    
+                    if (trainCount + testCount + validCount > filePairsToProcess.length) {
+                        throw new Error(`请求的文件总数 (${trainCount + testCount + validCount}) 超过了可用文件数 (${filePairsToProcess.length})`);
+                    }
+                }
+                
+                log(`划分方案: 训练集 ${trainCount}, 测试集 ${testCount}, 验证集 ${validCount}`);
+                
+                // 分割 - 按顺序依次分配到训练集、测试集和验证集
+                const trainFiles = filePairsToProcess.slice(0, trainCount);
+                const testFiles = filePairsToProcess.slice(trainCount, trainCount + testCount);
+                const validFiles = filePairsToProcess.slice(trainCount + testCount, trainCount + testCount + validCount);
+                
+                // 创建目录
+                updateProgress(20, '正在创建目标目录...');
+                const trainDir = await ensureDirectoryExists(destDirHandle, 'train');
+                const testDir = await ensureDirectoryExists(destDirHandle, 'test');
+                const validDir = await ensureDirectoryExists(destDirHandle, 'valid');
+                
+                let trainImageDir = trainDir, trainLabelDir = trainDir;
+                let testImageDir = testDir, testLabelDir = testDir;
+                let validImageDir = validDir, validLabelDir = validDir;
+                
+                if (useSubfolders) {
+                    trainImageDir = await ensureDirectoryExists(trainDir, 'images');
+                    trainLabelDir = await ensureDirectoryExists(trainDir, 'labels');
+                    testImageDir = await ensureDirectoryExists(testDir, 'images');
+                    testLabelDir = await ensureDirectoryExists(testDir, 'labels');
+                    validImageDir = await ensureDirectoryExists(validDir, 'images');
+                    validLabelDir = await ensureDirectoryExists(validDir, 'labels');
+                }
+                
+                // 复制文件到各个目录
+                const totalFilesToCopy = trainCount + testCount + validCount;
+                let copiedFiles = 0;
+                const baseProgress = 30;
+                const progressPerFile = 70 / totalFilesToCopy;
+                
+                // 复制训练集文件
+                updateProgress(baseProgress, `正在复制训练集文件 (${trainCount} 个)...`);
+                for (const pair of trainFiles) {
+                    await copyFile(pair.image, trainImageDir, pair.image.name);
+                    await copyFile(pair.label, trainLabelDir, pair.label.name);
+                    copiedFiles++;
+                    const progress = baseProgress + (copiedFiles * progressPerFile);
+                    updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
+                }
+                
+                // 复制测试集文件
+                updateProgress(baseProgress + (trainCount * progressPerFile), `正在复制测试集文件 (${testCount} 个)...`);
+                for (const pair of testFiles) {
+                    await copyFile(pair.image, testImageDir, pair.image.name);
+                    await copyFile(pair.label, testLabelDir, pair.label.name);
+                    copiedFiles++;
+                    const progress = baseProgress + (copiedFiles * progressPerFile);
+                    updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
+                }
+                
+                // 复制验证集文件
+                updateProgress(baseProgress + ((trainCount + testCount) * progressPerFile), `正在复制验证集文件 (${validCount} 个)...`);
+                for (const pair of validFiles) {
+                    await copyFile(pair.image, validImageDir, pair.image.name);
+                    await copyFile(pair.label, validLabelDir, pair.label.name);
+                    copiedFiles++;
+                    const progress = baseProgress + (copiedFiles * progressPerFile);
+                    updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
+                }
+                
+                updateProgress(100, '数据集划分完成!');
+                
+                // 显示结果
+                resultDetails.innerHTML = `
+                    <li>训练集: ${trainCount} 个文件对</li>
+                    <li>测试集: ${testCount} 个文件对</li>
+                    <li>验证集: ${validCount} 个文件对</li>
+                    <li>存储位置: ${destPath.value}</li>
+                `;
+                successMessage.classList.remove('hidden');
+                resultSection.classList.remove('hidden');
+                progressSection.classList.add('hidden');
+                
+            } catch (err) {
+                console.error('划分失败:', err);
+                log(`错误: ${err.message}`);
+                errorDetails.textContent = err.message;
+                errorMessage.classList.remove('hidden');
+                resultSection.classList.remove('hidden');
+                progressSection.classList.add('hidden');
+            }
+        }
+        
+        // 重置功能
+        function resetAll() {
+            sourcePath.value = '未选择文件夹';
+            destPath.value = '未选择文件夹';
+            sourceDirHandle = null;
+            destDirHandle = null;
+            allFilePairs = [];
+            
+            trainRatio.value = 7.0;
+            testRatio.value = 2.0;
+            validRatio.value = 1.0;
+            trainCountInput.value = 0;
+            testCountInput.value = 0;
+            validCountInput.value = 0;
+            
+            totalFilesCount.textContent = '0';
+            scanStatus.textContent = '(请先选择源目录)';
+            
+            progressSection.classList.add('hidden');
+            resultSection.classList.add('hidden');
+            successMessage.classList.add('hidden');
+            errorMessage.classList.add('hidden');
+            
+            updateRatioDisplay();
+            updateCountDisplay();
+            checkStartButton();
+        }
+        
+        // 事件监听
+        modeRatioBtn.addEventListener('click', () => setMode('ratio'));
+        modeCountBtn.addEventListener('click', () => setMode('count'));
+        
+        trainRatio.addEventListener('input', updateRatioDisplay);
+        testRatio.addEventListener('input', updateRatioDisplay);
+        validRatio.addEventListener('input', updateRatioDisplay);
+        
+        trainCountInput.addEventListener('input', updateCountDisplay);
+        testCountInput.addEventListener('input', updateCountDisplay);
+        validCountInput.addEventListener('input', updateCountDisplay);
+        
+        selectSource.addEventListener('click', async () => {
+            const dirHandle = await selectDirectory(sourcePath);
+            if (dirHandle) {
+                sourceDirHandle = dirHandle;
+                await scanSourceDirectory();
+                checkStartButton();
+            }
+        });
+        
+        selectDest.addEventListener('click', async () => {
+            const dirHandle = await selectDirectory(destPath);
+            if (dirHandle) {
+                destDirHandle = dirHandle;
+                checkStartButton();
+            }
+        });
+        
+        imageExtensions.addEventListener('change', scanSourceDirectory);
+        labelExtensions.addEventListener('change', scanSourceDirectory);
+        
+        startSplit.addEventListener('click', splitDataset);
+        resetButton.addEventListener('click', resetAll);
+        
+        // 初始化
+        setMode('ratio');
+    </script>
+</body>
+</html>

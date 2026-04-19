@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import os
+import random
+import webbrowser
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import shutil
@@ -50,6 +52,7 @@ from ..constants import (
     DEFAULT_ZOOM_SCALE,
     FORMAT_LABELS,
     FORMAT_SUFFIX,
+    IMAGE_EXTENSIONS,
     MAX_ZOOM_SCALE,
     MIN_ZOOM_SCALE,
     ZOOM_STEP,
@@ -93,11 +96,44 @@ class DatasetDeleteRecord:
 @dataclass(slots=True)
 class MergeImageTask:
     root_name: str
+    source_dataset_tag: str
     source_image_path: Path
     source_label_path: Path | None
     source_manager_state: ClassManagerState
+    source_class_id_to_target_id: dict[int, int]
     output_image_path: Path
     output_label_path: Path
+
+
+@dataclass(slots=True)
+class MergeDatasetLayout:
+    mode: str
+    image_templates: tuple[str, ...]
+    label_templates: tuple[str, ...]
+    split_names: tuple[str, ...]
+    image_split_map: dict[Path, str]
+
+    @property
+    def signature(self) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return (self.mode, self.image_templates, self.label_templates, self.split_names)
+
+
+@dataclass(slots=True)
+class MergeDatasetSource:
+    root: Path
+    service: DatasetService
+    source_manager_state: ClassManagerState
+    layout: MergeDatasetLayout
+    dataset_tag: str
+    class_id_map: dict[int, int]
+
+
+@dataclass(slots=True)
+class ExtractDatasetItem:
+    image_path: Path
+    label_path: Path | None
+    relative_path: Path
+    class_counts: dict[int, int]
 
 
 class AnnotationMainWindow(QMainWindow):
@@ -1328,36 +1364,20 @@ class AnnotationMainWindow(QMainWindow):
     def _build_export_tab(self) -> QWidget:
         page = QWidget(self)
 
-        export_section = CollapsibleSection("导出与转换", expanded=True, parent=page)
+        export_section = CollapsibleSection("目标设置", expanded=True, parent=page)
         self._style_section_header(export_section, "#9ac6ff")
         export_form = QFormLayout()
+        export_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        export_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        export_form.setVerticalSpacing(8)
+
         self.export_format_combo = QComboBox()
         for key in ("json", "xml", "txt"):
             self.export_format_combo.addItem(FORMAT_LABELS[key], key)
         self.export_format_combo.setCurrentIndex(2)
         export_form.addRow("目标格式", self.export_format_combo)
-        export_section.content_layout_ref().addLayout(export_form)
-
-        export_buttons = QHBoxLayout()
-        self.export_current_button = QPushButton("导出当前")
-        self.export_current_button.setObjectName("primaryButton")
-        self.export_current_button.clicked.connect(self.export_current_annotation)
-        self.export_batch_button = QPushButton("批量转换")
-        self.export_batch_button.clicked.connect(self.batch_convert_dataset)
-        export_buttons.addWidget(self.export_current_button)
-        export_buttons.addWidget(self.export_batch_button)
-        export_section.content_layout_ref().addLayout(export_buttons)
-
-        merge_row = QHBoxLayout()
-        self.export_merge_button = QPushButton("合并多个数据集")
-        self.export_merge_button.clicked.connect(self.merge_multiple_datasets)
-        merge_row.addWidget(self.export_merge_button)
-        merge_row.addStretch(1)
-        export_section.content_layout_ref().addLayout(merge_row)
 
         resize_row = QHBoxLayout()
-        resize_label = QLabel("目标尺寸")
-        resize_label.setObjectName("mutedLabel")
         self.export_resize_width_spin = QSpinBox()
         self.export_resize_width_spin.setRange(64, 8192)
         self.export_resize_width_spin.setValue(640)
@@ -1371,15 +1391,26 @@ class AnnotationMainWindow(QMainWindow):
         self.export_resize_button = QPushButton("尺寸转换导出")
         self.export_resize_button.setObjectName("primaryButton")
         self.export_resize_button.clicked.connect(self.batch_resize_export_dataset)
-        resize_row.addWidget(resize_label)
         resize_row.addWidget(self.export_resize_width_spin)
         resize_row.addWidget(self.export_resize_height_spin)
         resize_row.addWidget(self.export_resize_letterbox_checkbox)
         resize_row.addWidget(self.export_resize_button)
         resize_row.addStretch(1)
-        export_section.content_layout_ref().addLayout(resize_row)
+        export_form.addRow("目标尺寸", resize_row)
+        export_section.content_layout_ref().addLayout(export_form)
+
+        export_buttons = QHBoxLayout()
+        self.export_current_button = QPushButton("导出当前")
+        self.export_current_button.setObjectName("primaryButton")
+        self.export_current_button.clicked.connect(self.export_current_annotation)
+        self.export_batch_button = QPushButton("批量转换")
+        self.export_batch_button.clicked.connect(self.batch_convert_dataset)
+        export_buttons.addWidget(self.export_current_button)
+        export_buttons.addWidget(self.export_batch_button)
+        export_section.content_layout_ref().addLayout(export_buttons)
 
         self.export_path_hint_label = QLabel("将以当前图片同名文件输出到对应格式。")
+        self.export_path_hint_label.setObjectName("mutedLabel")
         self.export_path_hint_label.setWordWrap(True)
         export_section.content_layout_ref().addWidget(self.export_path_hint_label)
 
@@ -1390,8 +1421,46 @@ class AnnotationMainWindow(QMainWindow):
         self.export_resize_hint_label.setWordWrap(True)
         export_section.content_layout_ref().addWidget(self.export_resize_hint_label)
 
+        dataset_tools_section = CollapsibleSection("数据集工具", expanded=True, parent=page)
+        self._style_section_header(dataset_tools_section, "#7ec7a0")
+
+        merge_row = QHBoxLayout()
+        self.export_merge_button = QPushButton("合并数据集")
+        self.export_merge_button.clicked.connect(self.merge_multiple_datasets)
+        self.export_splitter_button = QPushButton("划分数据集")
+        self.export_splitter_button.clicked.connect(self.open_dataset_splitter_tool)
+        self.export_extract_button = QPushButton("抽取数据集(Mini)")
+        self.export_extract_button.clicked.connect(self.extract_dataset_mini)
+        merge_row.addWidget(self.export_merge_button)
+        merge_row.addWidget(self.export_splitter_button)
+        merge_row.addWidget(self.export_extract_button)
+        dataset_tools_section.content_layout_ref().addLayout(merge_row)
+
+        extract_form = QFormLayout()
+        extract_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        extract_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        extract_form.setVerticalSpacing(8)
+        self.export_extract_ratio_spin = QSpinBox()
+        self.export_extract_ratio_spin.setRange(1, 100)
+        self.export_extract_ratio_spin.setValue(20)
+        self.export_extract_ratio_spin.setSuffix(" %")
+        self.export_extract_seed_spin = QSpinBox()
+        self.export_extract_seed_spin.setRange(0, 999999)
+        self.export_extract_seed_spin.setValue(42)
+        extract_form.addRow("抽取比例", self.export_extract_ratio_spin)
+        extract_form.addRow("随机种子", self.export_extract_seed_spin)
+        dataset_tools_section.content_layout_ref().addLayout(extract_form)
+
+        dataset_tools_hint = QLabel(
+            "抽取功能按 train/val/test 分别采样，并尽量保持各类别比例；划分功能会打开 tools/dataset_splitter.html。"
+        )
+        dataset_tools_hint.setObjectName("mutedLabel")
+        dataset_tools_hint.setWordWrap(True)
+        dataset_tools_section.content_layout_ref().addWidget(dataset_tools_hint)
+
         return self._build_splitter_tab([
-            (export_section, 1),
+            (export_section, 2),
+            (dataset_tools_section, 3),
         ])
 
     def _build_settings_tab(self) -> QWidget:
@@ -1814,23 +1883,520 @@ class AnnotationMainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _save_yolo_txt_with_mapping(
+    def _save_yolo_txt_with_id_mapping(
         self,
         label_path: Path,
         boxes: list[Box],
         image_size: tuple[int, int],
-        class_name_to_id: dict[str, int],
+        source_manager: ClassManager,
+        source_class_id_to_target_id: dict[int, int],
     ) -> None:
         width, height = image_size
         lines: list[str] = []
         for box in boxes:
-            class_id = class_name_to_id.get(box.class_name)
+            source_class_id = source_manager.get_id(box.class_name)
+            if source_class_id is None:
+                try:
+                    source_class_id = source_manager.ensure_name(box.class_name)
+                except Exception:
+                    continue
+            class_id = source_class_id_to_target_id.get(int(source_class_id))
             if class_id is None:
                 continue
             cx, cy, bw, bh = box.normalized(width, height)
             lines.append(f"{int(class_id)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
         label_path.parent.mkdir(parents=True, exist_ok=True)
         label_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def _extract_merge_split_name(self, relative_path: Path) -> str | None:
+        for part in relative_path.parts:
+            lowered = part.strip().lower()
+            if lowered in {"train", "val", "test"}:
+                return lowered
+        return None
+
+    def _normalize_merge_template(self, relative_parent: Path) -> str:
+        tokens: list[str] = []
+        for part in relative_parent.parts:
+            lowered = part.strip().lower()
+            if lowered in {"train", "val", "test"}:
+                tokens.append("{split}")
+            else:
+                tokens.append(lowered)
+        return "/".join(tokens) if tokens else "."
+
+    def _analyze_merge_dataset_layout(
+        self,
+        root: Path,
+        service: DatasetService,
+    ) -> tuple[MergeDatasetLayout | None, str | None]:
+        image_templates: set[str] = set()
+        label_templates: set[str] = set()
+        split_names: set[str] = set()
+        image_split_map: dict[Path, str] = {}
+        has_split_images = False
+        has_unsplit_images = False
+
+        for image_path in service.image_paths:
+            try:
+                image_relative = image_path.relative_to(root)
+            except Exception:
+                image_relative = Path(image_path.name)
+
+            split_name = self._extract_merge_split_name(image_relative)
+            if split_name is None:
+                has_unsplit_images = True
+                image_split_map[image_path] = "all"
+            else:
+                has_split_images = True
+                split_names.add(split_name)
+                image_split_map[image_path] = split_name
+
+            image_templates.add(self._normalize_merge_template(image_relative.parent))
+
+            label_path = service.find_label_for_image(image_path)
+            if label_path is None:
+                continue
+
+            try:
+                label_relative = label_path.relative_to(root)
+            except Exception:
+                label_relative = Path(label_path.name)
+            label_templates.add(self._normalize_merge_template(label_relative.parent))
+
+        if has_split_images and has_unsplit_images:
+            return None, "同一数据集中同时存在未划分与 train/val/test 划分目录，无法安全合并。"
+
+        if has_split_images:
+            required = {"train", "val", "test"}
+            if split_names != required:
+                missing = sorted(required - split_names)
+                extra = sorted(split_names - required)
+                detail_parts: list[str] = []
+                if missing:
+                    detail_parts.append(f"缺少分级: {', '.join(missing)}")
+                if extra:
+                    detail_parts.append(f"额外分级: {', '.join(extra)}")
+                detail = "；".join(detail_parts) if detail_parts else "目录分级与 train/val/test 不一致"
+                return None, f"已划分数据集必须包含 train/val/test。{detail}。"
+
+        mode = "split" if has_split_images else "unsplit"
+        layout = MergeDatasetLayout(
+            mode=mode,
+            image_templates=tuple(sorted(image_templates)),
+            label_templates=tuple(sorted(label_templates)),
+            split_names=tuple(sorted(split_names)),
+            image_split_map=image_split_map,
+        )
+        return layout, None
+
+    def _describe_merge_layout(self, layout: MergeDatasetLayout) -> str:
+        image_templates = ", ".join(layout.image_templates) if layout.image_templates else "(无)"
+        label_templates = ", ".join(layout.label_templates) if layout.label_templates else "(无标签)"
+        if layout.mode == "split":
+            split_names = ", ".join(layout.split_names) if layout.split_names else "(未识别)"
+            return (
+                f"类型: 已划分 ({split_names})\n"
+                f"图片目录模板: {image_templates}\n"
+                f"标签目录模板: {label_templates}"
+            )
+        return (
+            "类型: 未划分\n"
+            f"图片目录模板: {image_templates}\n"
+            f"标签目录模板: {label_templates}"
+        )
+
+    def _build_merge_class_name(self, dataset_tag: str, source_name: str, global_manager: ClassManager) -> str:
+        base_name = str(source_name).strip() or "object"
+        candidate = f"{dataset_tag}/{base_name}"
+        if candidate not in global_manager.name_to_id:
+            return candidate
+
+        suffix = 2
+        while f"{candidate}_{suffix}" in global_manager.name_to_id:
+            suffix += 1
+        return f"{candidate}_{suffix}"
+
+    def _ensure_merge_class_id_mapping(
+        self,
+        dataset_tag: str,
+        source_manager: ClassManager,
+        source_class_id_to_target_id: dict[int, int],
+        global_manager: ClassManager,
+    ) -> None:
+        for source_id, source_name in source_manager.sorted_items():
+            source_id = int(source_id)
+            if source_id in source_class_id_to_target_id:
+                continue
+            target_id = global_manager.next_available_id()
+            target_name = self._build_merge_class_name(dataset_tag, source_name, global_manager)
+            global_manager.ensure_id(target_id, target_name)
+            source_class_id_to_target_id[source_id] = target_id
+
+    def _write_merge_data_yaml(
+        self,
+        output_root: Path,
+        class_mapping: dict[int, str],
+        split_mode: bool,
+    ) -> None:
+        lines: list[str] = []
+        if split_mode:
+            lines.extend([
+                "train: images/train",
+                "val: images/val",
+                "test: images/test",
+            ])
+        else:
+            lines.extend([
+                "train: images",
+                "val: images",
+            ])
+
+        lines.append("")
+        lines.append(f"nc: {len(class_mapping)}")
+        lines.append("names:")
+        if class_mapping:
+            for class_id, class_name in sorted(class_mapping.items(), key=lambda item: int(item[0])):
+                escaped = str(class_name).replace("'", "''")
+                lines.append(f"  {int(class_id)}: '{escaped}'")
+        else:
+            lines.append("  {}")
+
+        (output_root / "data.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _resolve_dataset_splitter_html(self) -> Path | None:
+        module_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            module_root / "tools" / "dataset_splitter.html",
+            module_root / "dataset_splitter.html",
+            module_root.parent.parent / "dataset_splitter.html",
+            Path.cwd() / "tools" / "dataset_splitter.html",
+            Path.cwd() / "dataset_splitter.html",
+        ]
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            if resolved.exists() and resolved.is_file():
+                return resolved
+        return None
+
+    def open_dataset_splitter_tool(self) -> None:
+        html_path = self._resolve_dataset_splitter_html()
+        if html_path is None:
+            self._warning_dialog(
+                "未找到划分工具",
+                "未检测到 dataset_splitter.html。",
+                informative_text="请确认文件位于 tools/dataset_splitter.html。",
+            )
+            return
+
+        try:
+            opened = webbrowser.open(html_path.as_uri())
+        except Exception as exc:
+            self._error_dialog(
+                "打开失败",
+                "无法启动数据集划分工具页面。",
+                informative_text=str(exc),
+                details=str(html_path),
+            )
+            return
+
+        if opened:
+            self._set_status_message(f"已打开划分工具：{html_path.name}")
+        else:
+            self._info_dialog(
+                "请手动打开",
+                "系统未能自动拉起浏览器，请手动打开该文件。",
+                details=str(html_path),
+            )
+
+    def _parse_yolo_txt_class_counts(self, label_path: Path) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        if not label_path.exists() or label_path.suffix.lower() != ".txt":
+            return counts
+
+        for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            try:
+                class_id = int(float(parts[0]))
+            except Exception:
+                continue
+            counts[class_id] = counts.get(class_id, 0) + 1
+        return counts
+
+    def _collect_split_dataset_items(
+        self,
+        source_root: Path,
+        split_name: str,
+    ) -> tuple[list[ExtractDatasetItem], dict[int, int]]:
+        images_dir = source_root / "images" / split_name
+        labels_dir = source_root / "labels" / split_name
+        items: list[ExtractDatasetItem] = []
+        class_totals: dict[int, int] = {}
+
+        if not images_dir.exists() or not labels_dir.exists():
+            return items, class_totals
+
+        image_paths = [
+            path
+            for path in images_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        image_paths.sort(key=lambda item: str(item).lower())
+
+        for image_path in image_paths:
+            relative_path = image_path.relative_to(images_dir)
+            expected_label_path = (labels_dir / relative_path).with_suffix(".txt")
+            label_path = expected_label_path if expected_label_path.exists() else None
+            class_counts = self._parse_yolo_txt_class_counts(label_path) if label_path is not None else {}
+            for class_id, count in class_counts.items():
+                class_totals[class_id] = class_totals.get(class_id, 0) + int(count)
+            items.append(
+                ExtractDatasetItem(
+                    image_path=image_path,
+                    label_path=label_path,
+                    relative_path=relative_path,
+                    class_counts=class_counts,
+                )
+            )
+
+        return items, class_totals
+
+    def _sample_extract_items_with_ratio(
+        self,
+        items: list[ExtractDatasetItem],
+        class_totals: dict[int, int],
+        sample_ratio: float,
+        seed: int,
+    ) -> list[ExtractDatasetItem]:
+        if not items:
+            return []
+
+        target_count = int(round(len(items) * sample_ratio))
+        if sample_ratio > 0:
+            target_count = max(1, target_count)
+        target_count = min(len(items), target_count)
+        if target_count >= len(items):
+            return list(items)
+
+        target_class_totals = {class_id: count * sample_ratio for class_id, count in class_totals.items()}
+        selected: list[ExtractDatasetItem] = []
+        selected_counts: dict[int, int] = {}
+
+        rng = random.Random(int(seed))
+        remaining_indices = list(range(len(items)))
+        rng.shuffle(remaining_indices)
+
+        while remaining_indices and len(selected) < target_count:
+            if len(remaining_indices) > 240:
+                candidate_indices = rng.sample(remaining_indices, 240)
+            else:
+                candidate_indices = list(remaining_indices)
+
+            progress_ratio = float(len(selected) + 1) / float(target_count)
+            best_index = candidate_indices[0]
+            best_score = float("inf")
+
+            for index in candidate_indices:
+                item = items[index]
+                score = 0.0
+                for class_id, target_total in target_class_totals.items():
+                    desired = target_total * progress_ratio
+                    projected = selected_counts.get(class_id, 0) + item.class_counts.get(class_id, 0)
+                    score += abs(projected - desired) / max(1.0, target_total)
+
+                if not item.class_counts:
+                    score += 0.03
+
+                score += rng.random() * 1e-6
+                if score < best_score:
+                    best_score = score
+                    best_index = index
+
+            selected_item = items[best_index]
+            selected.append(selected_item)
+            for class_id, count in selected_item.class_counts.items():
+                selected_counts[class_id] = selected_counts.get(class_id, 0) + int(count)
+            remaining_indices.remove(best_index)
+
+        if len(selected) < target_count:
+            for index in remaining_indices[: target_count - len(selected)]:
+                selected.append(items[index])
+
+        return selected
+
+    def _aggregate_extract_class_counts(self, items: list[ExtractDatasetItem]) -> dict[int, int]:
+        aggregated: dict[int, int] = {}
+        for item in items:
+            for class_id, count in item.class_counts.items():
+                aggregated[class_id] = aggregated.get(class_id, 0) + int(count)
+        return aggregated
+
+    def extract_dataset_mini(self) -> None:
+        default_root = str(self.dataset_service.root_dir) if self.dataset_service.root_dir else ""
+        source_root_text = QFileDialog.getExistingDirectory(self, "选择待抽取的数据集根目录", default_root)
+        if not source_root_text:
+            return
+
+        source_root = Path(source_root_text)
+        splits = ("train", "val", "test")
+        required_dirs = [
+            source_root / "images" / split_name
+            for split_name in splits
+        ] + [
+            source_root / "labels" / split_name
+            for split_name in splits
+        ]
+        missing = [str(path.relative_to(source_root)) for path in required_dirs if not path.exists()]
+        if missing:
+            self._warning_dialog(
+                "结构不完整",
+                "抽取功能仅支持已划分数据集（images/labels 下包含 train、val、test）。",
+                informative_text="缺失目录：" + "，".join(missing[:8]),
+                details=str(source_root),
+            )
+            return
+
+        output_dir_text = QFileDialog.getExistingDirectory(self, "选择抽取输出目录")
+        if not output_dir_text:
+            return
+
+        output_root = Path(output_dir_text)
+        if self._is_path_within(output_root, source_root):
+            self._warning_dialog(
+                "输出目录无效",
+                "输出目录不能位于源数据集内部。",
+                informative_text="请重新选择独立目录。",
+            )
+            return
+
+        if output_root.exists() and any(output_root.iterdir()):
+            reply = self._ask_dialog(
+                "目录非空",
+                "输出目录已有文件，继续可能覆盖同名文件。是否继续？",
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                default_button=QMessageBox.StandardButton.No,
+                button_texts={
+                    QMessageBox.StandardButton.Yes: "继续",
+                    QMessageBox.StandardButton.No: "取消",
+                },
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        ratio_percent = int(self.export_extract_ratio_spin.value()) if hasattr(self, "export_extract_ratio_spin") else 20
+        sample_ratio = max(0.01, min(1.0, ratio_percent / 100.0))
+        random_seed = int(self.export_extract_seed_spin.value()) if hasattr(self, "export_extract_seed_spin") else 42
+
+        source_items: dict[str, list[ExtractDatasetItem]] = {}
+        source_class_totals: dict[str, dict[int, int]] = {}
+        for split_name in splits:
+            items, class_totals = self._collect_split_dataset_items(source_root, split_name)
+            if not items:
+                self._warning_dialog(
+                    "分级为空",
+                    f"{split_name} 未发现可抽取图片。",
+                    informative_text=f"请检查 images/{split_name} 目录。",
+                    details=str(source_root),
+                )
+                return
+            source_items[split_name] = items
+            source_class_totals[split_name] = class_totals
+
+        sampled_items: dict[str, list[ExtractDatasetItem]] = {}
+        for split_index, split_name in enumerate(splits):
+            sampled_items[split_name] = self._sample_extract_items_with_ratio(
+                source_items[split_name],
+                source_class_totals[split_name],
+                sample_ratio,
+                seed=random_seed + split_index * 1009,
+            )
+
+        total_to_copy = sum(len(items) for items in sampled_items.values())
+        if total_to_copy <= 0:
+            self._info_dialog("抽取结果", "没有可抽取的样本。")
+            return
+
+        for split_name in splits:
+            (output_root / "images" / split_name).mkdir(parents=True, exist_ok=True)
+            (output_root / "labels" / split_name).mkdir(parents=True, exist_ok=True)
+
+        copied = 0
+        copied_items: dict[str, list[ExtractDatasetItem]] = {split_name: [] for split_name in splits}
+        cancelled = False
+        progress = QProgressDialog("正在抽取数据集...", "取消", 0, total_to_copy, self)
+        progress.setWindowTitle("抽取数据集")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+
+        for split_name in splits:
+            for item in sampled_items[split_name]:
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+                output_image_path = output_root / "images" / split_name / item.relative_path
+                output_image_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item.image_path, output_image_path)
+
+                if item.label_path is not None and item.label_path.exists():
+                    output_label_path = (output_root / "labels" / split_name / item.relative_path).with_suffix(".txt")
+                    output_label_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item.label_path, output_label_path)
+
+                copied_items[split_name].append(item)
+                copied += 1
+                progress.setValue(copied)
+                progress.setLabelText(f"正在处理: {split_name}/{item.image_path.name}")
+
+            if cancelled:
+                break
+
+        progress.setValue(copied)
+        progress.close()
+
+        source_manager = ClassManager()
+        source_manager.load_from_root(source_root)
+        class_mapping = dict(source_manager.id_to_name)
+        if not class_mapping:
+            observed_ids: set[int] = set()
+            for split_name in splits:
+                observed_ids.update(source_class_totals[split_name].keys())
+            class_mapping = {class_id: f"ID {class_id}" for class_id in sorted(observed_ids)}
+        self._write_merge_data_yaml(output_root, class_mapping, split_mode=True)
+
+        details_lines = [
+            f"源目录：{source_root}",
+            f"输出目录：{output_root}",
+            f"抽取比例：{ratio_percent}%",
+            f"随机种子：{random_seed}",
+            "",
+        ]
+        for split_name in splits:
+            before_images = len(source_items[split_name])
+            after_images = len(copied_items[split_name])
+            before_counts = source_class_totals[split_name]
+            after_counts = self._aggregate_extract_class_counts(copied_items[split_name])
+            before_total = sum(before_counts.values())
+            after_total = sum(after_counts.values())
+            details_lines.append(
+                f"{split_name}: 图片 {after_images}/{before_images}，标注 {after_total}/{before_total}"
+            )
+
+        self._info_dialog(
+            "抽取已取消" if cancelled else "抽取完成",
+            f"已抽取 {copied} 张图片。",
+            informative_text="已按 train/val/test 分级输出，并保持类别比例尽量一致。",
+            details="\n".join(details_lines),
+        )
 
     def _merge_single_image_worker(
         self,
@@ -1853,14 +2419,26 @@ class AnnotationMainWindow(QMainWindow):
             boxes = []
 
         try:
+            task.output_image_path.parent.mkdir(parents=True, exist_ok=True)
+            task.output_label_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(task.source_image_path, task.output_image_path)
 
             with mapping_lock:
-                for box in boxes:
-                    global_manager.ensure_name(box.class_name)
-                class_name_to_id = dict(global_manager.name_to_id)
+                self._ensure_merge_class_id_mapping(
+                    task.source_dataset_tag,
+                    local_manager,
+                    task.source_class_id_to_target_id,
+                    global_manager,
+                )
+                source_class_id_to_target_id = dict(task.source_class_id_to_target_id)
 
-            self._save_yolo_txt_with_mapping(task.output_label_path, boxes, image_size, class_name_to_id)
+            self._save_yolo_txt_with_id_mapping(
+                task.output_label_path,
+                boxes,
+                image_size,
+                local_manager,
+                source_class_id_to_target_id,
+            )
             return True
         except Exception:
             try:
@@ -3828,6 +4406,9 @@ class AnnotationMainWindow(QMainWindow):
 
         merged, skipped, class_count, cancelled = self._merge_datasets_to_output(dataset_roots, output_root)
 
+        if merged < 0:
+            return
+
         if merged == 0:
             self._info_dialog("合并结果", "没有可合并的图片。")
             return
@@ -3836,7 +4417,7 @@ class AnnotationMainWindow(QMainWindow):
         self._info_dialog(
             title,
             f"已处理 {len(dataset_roots)} 个数据集，合并图片 {merged} 张。",
-            informative_text=f"跳过 {skipped} 张，统一类别数 {class_count}。",
+            informative_text=f"跳过 {skipped} 张，输出类别数 {class_count}。",
             details=(
                 f"输出目录：{output_root}\n"
                 "输出为 YOLO TXT 标签，映射已写入 data.yaml。"
@@ -3858,6 +4439,10 @@ class AnnotationMainWindow(QMainWindow):
 
     def _collect_merge_roots(self) -> list[Path]:
         roots: list[Path] = []
+        root_layouts: dict[Path, MergeDatasetLayout] = {}
+        reference_root: Path | None = None
+        reference_layout: MergeDatasetLayout | None = None
+
         while True:
             title = "选择要合并的第一个数据集目录" if not roots else "继续添加要合并的数据集目录"
             root_text = QFileDialog.getExistingDirectory(self, title)
@@ -3870,11 +4455,51 @@ class AnnotationMainWindow(QMainWindow):
             if root in roots:
                 self._info_dialog("已在列表中", "该目录已添加，无需重复添加。", details=str(root))
             else:
+                service = DatasetService()
+                service.scan(root)
+                if not service.image_paths:
+                    self._warning_dialog(
+                        "目录不可用",
+                        "该目录未发现可用图片，不能加入合并列表。",
+                        details=str(root),
+                    )
+                    continue
+
+                layout, layout_error = self._analyze_merge_dataset_layout(root, service)
+                if layout is None:
+                    self._warning_dialog(
+                        "结构识别失败",
+                        "该目录结构不满足合并要求。",
+                        informative_text=layout_error or "无法识别数据集结构。",
+                        details=str(root),
+                    )
+                    continue
+
+                if reference_layout is None:
+                    reference_root = root
+                    reference_layout = layout
+                elif layout.signature != reference_layout.signature:
+                    self._warning_dialog(
+                        "结构不一致",
+                        "当前数据集与已选数据集目录分级不一致，不能加入。",
+                        informative_text="请保证所有待合并数据集都为同一种结构（未划分或 train/val/test 划分，且目录模板一致）。",
+                        details=(
+                            f"已选基准：{reference_root}\n"
+                            f"{self._describe_merge_layout(reference_layout)}\n\n"
+                            f"当前目录：{root}\n"
+                            f"{self._describe_merge_layout(layout)}"
+                        ),
+                    )
+                    continue
+
                 roots.append(root)
+                root_layouts[root] = layout
 
             reply = self._ask_dialog(
                 "继续添加",
                 f"已选择 {len(roots)} 个数据集，是否继续添加？",
+                informative_text="可在详情中查看当前已选数据集结构摘要。",
+                details=self._build_merge_selection_summary(roots, root_layouts),
                 buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 default_button=QMessageBox.StandardButton.No,
                 button_texts={
@@ -3882,60 +4507,181 @@ class AnnotationMainWindow(QMainWindow):
                     QMessageBox.StandardButton.No: "开始合并",
                 },
             )
-            if reply != QMessageBox.StandardButton.Yes:
+
+            if reply == QMessageBox.StandardButton.Yes:
+                continue
+
+            confirm = self._ask_dialog(
+                "确认开始合并",
+                f"将合并 {len(roots)} 个数据集，是否开始？",
+                informative_text="请再次确认结构摘要后再继续。",
+                details=self._build_merge_selection_summary(roots, root_layouts),
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                default_button=QMessageBox.StandardButton.Yes,
+                button_texts={
+                    QMessageBox.StandardButton.Yes: "开始合并",
+                    QMessageBox.StandardButton.No: "返回继续选择",
+                },
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
                 break
 
         return roots
+
+    def _build_merge_selection_summary(
+        self,
+        roots: list[Path],
+        root_layouts: dict[Path, MergeDatasetLayout],
+    ) -> str:
+        if not roots:
+            return "尚未选择数据集。"
+
+        lines: list[str] = []
+        first_layout = root_layouts.get(roots[0])
+        if first_layout is not None:
+            mode_text = "已划分（train/val/test）" if first_layout.mode == "split" else "未划分"
+            lines.append(f"结构模式：{mode_text}")
+            lines.append("")
+
+        for index, root in enumerate(roots, start=1):
+            layout = root_layouts.get(root)
+            lines.append(f"[{index}] {root}")
+            if layout is None:
+                lines.append("  - 结构：未识别")
+                lines.append("")
+                continue
+
+            mode_text = "已划分" if layout.mode == "split" else "未划分"
+            image_templates = ", ".join(layout.image_templates) if layout.image_templates else "(无)"
+            label_templates = ", ".join(layout.label_templates) if layout.label_templates else "(无标签)"
+            split_names = ", ".join(layout.split_names) if layout.split_names else "-"
+            lines.append(f"  - 类型：{mode_text}")
+            lines.append(f"  - 分级：{split_names}")
+            lines.append(f"  - 图片模板：{image_templates}")
+            lines.append(f"  - 标签模板：{label_templates}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
 
     def _merge_datasets_to_output(
         self,
         dataset_roots: list[Path],
         output_root: Path,
     ) -> tuple[int, int, int, bool]:
-        output_images_dir = output_root / "images" / "train"
-        output_val_dir = output_root / "images" / "val"
-        output_images_dir.mkdir(parents=True, exist_ok=True)
-        output_val_dir.mkdir(parents=True, exist_ok=True)
-
-        sources: list[tuple[Path, DatasetService, ClassManager]] = []
+        sources: list[MergeDatasetSource] = []
         total_images = 0
+        reference_layout: MergeDatasetLayout | None = None
+        reference_root: Path | None = None
+        used_dataset_tags: set[str] = set()
+
         for root in dataset_roots:
             service = DatasetService()
             service.scan(root)
             if not service.image_paths:
                 continue
 
+            layout, layout_error = self._analyze_merge_dataset_layout(root, service)
+            if layout is None:
+                self._warning_dialog(
+                    "数据集结构不支持",
+                    f"目录 {root.name or str(root)} 无法参与合并。",
+                    informative_text=layout_error or "无法识别数据集目录结构。",
+                    details=str(root),
+                )
+                return (-1, 0, 0, False)
+
+            if reference_layout is None:
+                reference_layout = layout
+                reference_root = root
+            elif layout.signature != reference_layout.signature:
+                self._warning_dialog(
+                    "数据集结构不一致",
+                    "所选数据集目录分级不同，不能直接合并。",
+                    informative_text="请确保所有数据集的图片/标签目录层级一致（同为未划分或同为 train/val/test）。",
+                    details=(
+                        f"基准数据集：{reference_root}\n"
+                        f"{self._describe_merge_layout(reference_layout)}\n\n"
+                        f"当前数据集：{root}\n"
+                        f"{self._describe_merge_layout(layout)}"
+                    ),
+                )
+                return (-1, 0, 0, False)
+
             source_manager = ClassManager()
             source_manager.load_from_root(root)
             source_manager.root_dir = None
             source_manager.yaml_path = None
-            sources.append((root, service, source_manager))
+
+            base_tag = self._safe_merge_token(root.name or "dataset")
+            dataset_tag = self._unique_merge_stem(base_tag, used_dataset_tags)
+
+            sources.append(
+                MergeDatasetSource(
+                    root=root,
+                    service=service,
+                    source_manager_state=source_manager.snapshot(),
+                    layout=layout,
+                    dataset_tag=dataset_tag,
+                    class_id_map={},
+                )
+            )
             total_images += len(service.image_paths)
 
         if total_images == 0:
             return (0, 0, 0, False)
 
+        assert reference_layout is not None
+        split_mode = reference_layout.mode == "split"
+        if split_mode:
+            for split_name in ("train", "val", "test"):
+                (output_root / "images" / split_name).mkdir(parents=True, exist_ok=True)
+                (output_root / "labels" / split_name).mkdir(parents=True, exist_ok=True)
+        else:
+            (output_root / "images").mkdir(parents=True, exist_ok=True)
+            (output_root / "labels").mkdir(parents=True, exist_ok=True)
+
         global_manager = ClassManager()
         global_manager.root_dir = None
         global_manager.yaml_path = None
 
+        for source in sources:
+            source_manager = ClassManager()
+            source_manager.restore(source.source_manager_state)
+            source_manager.root_dir = None
+            source_manager.yaml_path = None
+            self._ensure_merge_class_id_mapping(
+                source.dataset_tag,
+                source_manager,
+                source.class_id_map,
+                global_manager,
+            )
+
         used_stems: set[str] = set()
         tasks: list[MergeImageTask] = []
-        for root, service, source_manager in sources:
-            dataset_tag = self._safe_merge_token(root.name or "dataset")
-            source_state = source_manager.snapshot()
+        for source in sources:
+            root = source.root
             root_name = root.name or str(root)
-            for image_path in service.image_paths:
-                stem = self._build_merge_stem(dataset_tag, root, image_path)
+            source_state = source.source_manager_state
+            for image_path in source.service.image_paths:
+                stem = self._build_merge_stem(source.dataset_tag, root, image_path)
                 unique_stem = self._unique_merge_stem(stem, used_stems)
-                output_image_path = output_images_dir / f"{unique_stem}{image_path.suffix.lower()}"
-                output_label_path = output_images_dir / f"{unique_stem}.txt"
+
+                split_name = source.layout.image_split_map.get(image_path, "all")
+                if split_mode:
+                    output_image_path = output_root / "images" / split_name / f"{unique_stem}{image_path.suffix.lower()}"
+                    output_label_path = output_root / "labels" / split_name / f"{unique_stem}.txt"
+                else:
+                    output_image_path = output_root / "images" / f"{unique_stem}{image_path.suffix.lower()}"
+                    output_label_path = output_root / "labels" / f"{unique_stem}.txt"
+
                 tasks.append(
                     MergeImageTask(
                         root_name=root_name,
+                        source_dataset_tag=source.dataset_tag,
                         source_image_path=image_path,
-                        source_label_path=service.find_label_for_image(image_path),
+                        source_label_path=source.service.find_label_for_image(image_path),
                         source_manager_state=source_state,
+                        source_class_id_to_target_id=source.class_id_map,
                         output_image_path=output_image_path,
                         output_label_path=output_label_path,
                     )
@@ -4012,9 +4758,7 @@ class AnnotationMainWindow(QMainWindow):
         progress.close()
 
         if merged > 0:
-            global_manager.root_dir = output_root
-            global_manager.yaml_path = output_root / "data.yaml"
-            global_manager.sync_to_yaml(force=True)
+            self._write_merge_data_yaml(output_root, global_manager.id_to_name, split_mode)
 
         return (merged, skipped, len(global_manager.id_to_name), cancelled)
 
@@ -4372,6 +5116,10 @@ class AnnotationMainWindow(QMainWindow):
         self.export_resize_height_spin.setEnabled(loaded)
         self.export_resize_letterbox_checkbox.setEnabled(loaded)
         self.export_merge_button.setEnabled(True)
+        self.export_splitter_button.setEnabled(True)
+        self.export_extract_button.setEnabled(True)
+        self.export_extract_ratio_spin.setEnabled(True)
+        self.export_extract_seed_spin.setEnabled(True)
         self.box_class_combo.setEnabled(loaded)
         self.box_list_widget.setEnabled(loaded)
         self.image_list_widget.setEnabled(loaded)
