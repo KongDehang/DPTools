@@ -52,7 +52,7 @@
                 <i class="fa fa-cubes text-primary mr-3"></i>数据集划分工具
             </h1>
             <p class="text-gray-600 max-w-2xl mx-auto">
-                按照指定比例将图像文件和对应的标注文件分配到训练集、测试集和验证集文件夹中
+                按照指定比例将图像文件和对应的标注文件分配到训练集、验证集和测试集文件夹中
             </p>
         </header>
         
@@ -92,14 +92,14 @@
                         >
                     </div>
                     
-                    <!-- 测试集比例 -->
+                    <!-- 验证集比例 -->
                     <div class="space-y-2">
-                        <label for="test-ratio" class="block text-sm font-medium text-gray-700">
-                            测试集比例: <span id="test-value" class="font-bold text-primary">2.0</span>/10
+                        <label for="valid-ratio" class="block text-sm font-medium text-gray-700">
+                            验证集比例: <span id="valid-value" class="font-bold text-primary">2.0</span>/10
                         </label>
                         <input 
                             type="range" 
-                            id="test-ratio" 
+                            id="valid-ratio" 
                             min="0" 
                             max="10" 
                             step="0.1"
@@ -108,14 +108,14 @@
                         >
                     </div>
                     
-                    <!-- 验证集比例 -->
+                    <!-- 测试集比例 -->
                     <div class="space-y-2">
-                        <label for="valid-ratio" class="block text-sm font-medium text-gray-700">
-                            验证集比例: <span id="valid-value" class="font-bold text-primary">1.0</span>/10
+                        <label for="test-ratio" class="block text-sm font-medium text-gray-700">
+                            测试集比例: <span id="test-value" class="font-bold text-primary">1.0</span>/10
                         </label>
                         <input 
                             type="range" 
-                            id="valid-ratio" 
+                            id="test-ratio" 
                             min="0" 
                             max="10" 
                             step="0.1"
@@ -171,20 +171,6 @@
                         >
                     </div>
                     
-                    <!-- 测试集数量 -->
-                    <div class="space-y-2">
-                        <label for="test-count" class="block text-sm font-medium text-gray-700">
-                            测试集数量
-                        </label>
-                        <input 
-                            type="number" 
-                            id="test-count" 
-                            min="0" 
-                            value="0" 
-                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
-                        >
-                    </div>
-                    
                     <!-- 验证集数量 -->
                     <div class="space-y-2">
                         <label for="valid-count" class="block text-sm font-medium text-gray-700">
@@ -193,6 +179,20 @@
                         <input 
                             type="number" 
                             id="valid-count" 
+                            min="0" 
+                            value="0" 
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
+                        >
+                    </div>
+                    
+                    <!-- 测试集数量 -->
+                    <div class="space-y-2">
+                        <label for="test-count" class="block text-sm font-medium text-gray-700">
+                            测试集数量
+                        </label>
+                        <input 
+                            type="number" 
+                            id="test-count" 
                             min="0" 
                             value="0" 
                             class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-primary outline-none"
@@ -473,8 +473,8 @@
         // 更新比例显示
         function updateRatioDisplay() {
             const train = parseFloat(trainRatio.value);
-            const test = parseFloat(testRatio.value);
             const valid = parseFloat(validRatio.value);
+            const test = parseFloat(testRatio.value);
             const total = train + test + valid;
             
             trainValue.textContent = train.toFixed(1);
@@ -496,8 +496,8 @@
         // 更新数量显示
         function updateCountDisplay() {
             const train = parseInt(trainCountInput.value) || 0;
-            const test = parseInt(testCountInput.value) || 0;
             const valid = parseInt(validCountInput.value) || 0;
+            const test = parseInt(testCountInput.value) || 0;
             const total = train + test + valid;
             const maxFiles = allFilePairs.length;
             
@@ -552,12 +552,12 @@
                 scanStatus.textContent = "";
                 
                 // 更新数量输入框的最大值建议
-                // 默认分配: 70% train, 20% test, 10% valid
-                if (parseInt(trainCountInput.value) === 0 && parseInt(testCountInput.value) === 0) {
+                // 默认分配: 70% train, 20% valid, 10% test
+                if (parseInt(trainCountInput.value) === 0 && parseInt(validCountInput.value) === 0 && parseInt(testCountInput.value) === 0) {
                     const total = allFilePairs.length;
                     trainCountInput.value = Math.floor(total * 0.7);
-                    testCountInput.value = Math.floor(total * 0.2);
-                    validCountInput.value = total - Math.floor(total * 0.7) - Math.floor(total * 0.2);
+                    validCountInput.value = Math.floor(total * 0.2);
+                    testCountInput.value = total - Math.floor(total * 0.7) - Math.floor(total * 0.2);
                 }
                 
                 updateCountDisplay();
@@ -726,34 +726,34 @@
                 }
                 
                 // 计算数量
-                let trainCount, testCount, validCount;
+                let trainCount, validCount, testCount;
                 
                 if (splitMode === 'ratio') {
                     const train = parseFloat(trainRatio.value);
-                    const test = parseFloat(testRatio.value);
                     const valid = parseFloat(validRatio.value);
+                    const test = parseFloat(testRatio.value);
                     const totalRatioSum = train + test + valid;
                     const totalFiles = filePairsToProcess.length;
                     
                     trainCount = Math.round((train / totalRatioSum) * totalFiles);
-                    testCount = Math.round((test / totalRatioSum) * totalFiles);
-                    validCount = totalFiles - trainCount - testCount;
+                    validCount = Math.round((valid / totalRatioSum) * totalFiles);
+                    testCount = totalFiles - trainCount - validCount;
                 } else {
                     trainCount = parseInt(trainCountInput.value) || 0;
-                    testCount = parseInt(testCountInput.value) || 0;
                     validCount = parseInt(validCountInput.value) || 0;
+                    testCount = parseInt(testCountInput.value) || 0;
                     
                     if (trainCount + testCount + validCount > filePairsToProcess.length) {
                         throw new Error(`请求的文件总数 (${trainCount + testCount + validCount}) 超过了可用文件数 (${filePairsToProcess.length})`);
                     }
                 }
                 
-                log(`划分方案: 训练集 ${trainCount}, 测试集 ${testCount}, 验证集 ${validCount}`);
+                log(`划分方案: 训练集 ${trainCount}, 验证集 ${validCount}, 测试集 ${testCount}`);
                 
-                // 分割 - 按顺序依次分配到训练集、测试集和验证集
+                // 分割 - 按顺序依次分配到训练集、验证集和测试集
                 const trainFiles = filePairsToProcess.slice(0, trainCount);
-                const testFiles = filePairsToProcess.slice(trainCount, trainCount + testCount);
-                const validFiles = filePairsToProcess.slice(trainCount + testCount, trainCount + testCount + validCount);
+                const validFiles = filePairsToProcess.slice(trainCount, trainCount + validCount);
+                const testFiles = filePairsToProcess.slice(trainCount + validCount, trainCount + validCount + testCount);
                 
                 // 创建目录
                 updateProgress(20, '正在创建目标目录...');
@@ -775,7 +775,7 @@
                 }
                 
                 // 复制文件到各个目录
-                const totalFilesToCopy = trainCount + testCount + validCount;
+                const totalFilesToCopy = trainCount + validCount + testCount;
                 let copiedFiles = 0;
                 const baseProgress = 30;
                 const progressPerFile = 70 / totalFilesToCopy;
@@ -790,21 +790,21 @@
                     updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
                 }
                 
-                // 复制测试集文件
-                updateProgress(baseProgress + (trainCount * progressPerFile), `正在复制测试集文件 (${testCount} 个)...`);
-                for (const pair of testFiles) {
-                    await copyFile(pair.image, testImageDir, pair.image.name);
-                    await copyFile(pair.label, testLabelDir, pair.label.name);
+                // 复制验证集文件
+                updateProgress(baseProgress + (trainCount * progressPerFile), `正在复制验证集文件 (${validCount} 个)...`);
+                for (const pair of validFiles) {
+                    await copyFile(pair.image, validImageDir, pair.image.name);
+                    await copyFile(pair.label, validLabelDir, pair.label.name);
                     copiedFiles++;
                     const progress = baseProgress + (copiedFiles * progressPerFile);
                     updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
                 }
-                
-                // 复制验证集文件
-                updateProgress(baseProgress + ((trainCount + testCount) * progressPerFile), `正在复制验证集文件 (${validCount} 个)...`);
-                for (const pair of validFiles) {
-                    await copyFile(pair.image, validImageDir, pair.image.name);
-                    await copyFile(pair.label, validLabelDir, pair.label.name);
+
+                // 复制测试集文件
+                updateProgress(baseProgress + ((trainCount + validCount) * progressPerFile), `正在复制测试集文件 (${testCount} 个)...`);
+                for (const pair of testFiles) {
+                    await copyFile(pair.image, testImageDir, pair.image.name);
+                    await copyFile(pair.label, testLabelDir, pair.label.name);
                     copiedFiles++;
                     const progress = baseProgress + (copiedFiles * progressPerFile);
                     updateProgress(progress, `已复制 ${copiedFiles}/${totalFilesToCopy} 个文件对`);
@@ -815,8 +815,8 @@
                 // 显示结果
                 resultDetails.innerHTML = `
                     <li>训练集: ${trainCount} 个文件对</li>
-                    <li>测试集: ${testCount} 个文件对</li>
                     <li>验证集: ${validCount} 个文件对</li>
+                    <li>测试集: ${testCount} 个文件对</li>
                     <li>存储位置: ${destPath.value}</li>
                 `;
                 successMessage.classList.remove('hidden');
@@ -842,8 +842,8 @@
             allFilePairs = [];
             
             trainRatio.value = 7.0;
-            testRatio.value = 2.0;
-            validRatio.value = 1.0;
+            validRatio.value = 2.0;
+            testRatio.value = 1.0;
             trainCountInput.value = 0;
             testCountInput.value = 0;
             validCountInput.value = 0;
