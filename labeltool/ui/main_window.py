@@ -293,6 +293,14 @@ class AnnotationMainWindow(QMainWindow):
             return icon
         return self._asset_icon("app_logo.svg", "SP_ComputerIcon", "SP_DesktopIcon")
 
+    def _recommended_parallel_workers(self, task_count: int) -> int:
+        if task_count <= 0:
+            return 1
+        import os
+        logical_cores = os.cpu_count() or 4
+        # I/O dominated tasks benefit from a slightly wider pool than CPU count.
+        return max(2, min(12, task_count, logical_cores * 2))
+
     def _dialog_stylesheet(self) -> str:
         return """
 QMessageBox {
