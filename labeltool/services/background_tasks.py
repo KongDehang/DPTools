@@ -8,17 +8,22 @@ import numpy as np
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QImage
 
-from ..constants import IMAGE_EXTENSIONS
 from .annotation_io import AnnotationIO
 from .dataset import DatasetService
 from .class_manager import ClassManager
 
 
 @dataclass(slots=True)
-class DatasetLoadResult:
+class DatasetScanResult:
     root_dir: Path
     image_paths: list[Path]
     label_paths: list[Path]
+    total_images: int
+
+
+@dataclass(slots=True)
+class DatasetStatisticsResult:
+    root_dir: Path
     class_counts: dict[str, int]
     total_images: int
     annotated_images: int
@@ -30,18 +35,66 @@ class DatasetScanWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, root_dir: str | Path, class_id_to_name: dict[int, str]) -> None:
+    def __init__(self, root_dir: str | Path, class_id_to_name: dict[int, str] | None = None) -> None:
         super().__init__()
         self.root_dir = Path(root_dir)
-        self.class_id_to_name = dict(class_id_to_name)
+        self.class_id_to_name = dict(class_id_to_name or {})
 
     def run(self) -> None:
         try:
             dataset_service = DatasetService()
             dataset_service.scan(self.root_dir)
+            total_images = len(dataset_service.image_paths)
+
+            if total_images == 0:
+                self.finished.emit(
+                    DatasetScanResult(
+                        root_dir=self.root_dir,
+                        image_paths=[],
+                        label_paths=[],
+                        total_images=0,
+                    )
+                )
+                return
+
+            self.progressChanged.emit(total_images, total_images)
+            self.finished.emit(
+                DatasetScanResult(
+                    root_dir=self.root_dir,
+                    image_paths=list(dataset_service.image_paths),
+                    label_paths=list(dataset_service.label_paths),
+                    total_images=total_images,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - background error path
+            self.failed.emit(str(exc))
+
+
+class DatasetStatisticsWorker(QObject):
+    progressChanged = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, scan_result: DatasetScanResult, class_id_to_name: dict[int, str]) -> None:
+        super().__init__()
+        self.scan_result = scan_result
+        self.class_id_to_name = dict(class_id_to_name)
+        self._cancel_requested = False
+
+    def stop(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        try:
+            dataset_service = DatasetService()
+            dataset_service.apply_scan_result(
+                self.scan_result.root_dir,
+                self.scan_result.image_paths,
+                self.scan_result.label_paths,
+            )
             annotation_io = AnnotationIO()
             class_manager = ClassManager()
-            class_manager.load_from_root(self.root_dir)
+            class_manager.load_from_root(self.scan_result.root_dir)
             class_id_to_name = dict(class_manager.id_to_name)
             for class_id, class_name in self.class_id_to_name.items():
                 if not class_name:
@@ -49,6 +102,7 @@ class DatasetScanWorker(QObject):
                 existing_name = class_id_to_name.get(class_id)
                 if existing_name is None or existing_name.startswith(("unknown_id_", "ID ")):
                     class_id_to_name[class_id] = class_name
+
             class_counts: dict[str, int] = {}
             annotated_images = 0
             total_boxes = 0
@@ -56,10 +110,8 @@ class DatasetScanWorker(QObject):
 
             if total_images == 0:
                 self.finished.emit(
-                    DatasetLoadResult(
-                        root_dir=self.root_dir,
-                        image_paths=[],
-                        label_paths=[],
+                    DatasetStatisticsResult(
+                        root_dir=self.scan_result.root_dir,
                         class_counts={},
                         total_images=0,
                         annotated_images=0,
@@ -69,6 +121,8 @@ class DatasetScanWorker(QObject):
                 return
 
             for index, image_path in enumerate(dataset_service.image_paths):
+                if self._cancel_requested:
+                    break
                 label_path = dataset_service.find_label_for_image(image_path)
                 if label_path is not None:
                     counts, box_count = annotation_io.count_annotation(label_path, class_id_to_name)
@@ -81,10 +135,8 @@ class DatasetScanWorker(QObject):
                     self.progressChanged.emit(index + 1, total_images)
 
             self.finished.emit(
-                DatasetLoadResult(
-                    root_dir=self.root_dir,
-                    image_paths=list(dataset_service.image_paths),
-                    label_paths=list(dataset_service.label_paths),
+                DatasetStatisticsResult(
+                    root_dir=self.scan_result.root_dir,
                     class_counts=class_counts,
                     total_images=total_images,
                     annotated_images=annotated_images,
@@ -96,7 +148,7 @@ class DatasetScanWorker(QObject):
 
 
 class ThumbnailLoadWorker(QObject):
-    thumbnailReady = pyqtSignal(int, object)
+    thumbnailReady = pyqtSignal(int, object, object)
     progressChanged = pyqtSignal(int, int)
     finished = pyqtSignal()
     failed = pyqtSignal(str)
@@ -124,6 +176,8 @@ class ThumbnailLoadWorker(QObject):
                 if not image_path.exists():
                     continue
                 try:
+                    stat_result = image_path.stat()
+                    signature = (stat_result.st_mtime_ns, stat_result.st_size)
                     data = np.fromfile(str(image_path), dtype=np.uint8)
                     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
                     if image is None:
@@ -141,7 +195,7 @@ class ThumbnailLoadWorker(QObject):
                     )
                     if self._cancel_requested:
                         break
-                    self.thumbnailReady.emit(index, thumbnail)
+                    self.thumbnailReady.emit(index, thumbnail, signature)
                 except Exception:
                     continue
 

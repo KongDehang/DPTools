@@ -69,9 +69,16 @@ from ..services import (
     save_shortcut_bindings,
     to_key_sequence,
 )
-from ..services.background_tasks import DatasetLoadResult, DatasetScanWorker, ThumbnailLoadWorker
+from ..services.background_tasks import (
+    DatasetScanResult,
+    DatasetScanWorker,
+    DatasetStatisticsResult,
+    DatasetStatisticsWorker,
+    ThumbnailLoadWorker,
+)
 from ..services.class_manager import ClassManagerState
 from .class_selector_dialog import ClassSelectorDialog
+from .class_checklist_dialog import ClassChecklistDialog
 from .canvas import AnnotationCanvas
 from .shortcut_editor_dialog import ShortcutEditorDialog
 from .statistics_widget import DatasetStatisticsWidget
@@ -174,7 +181,7 @@ class AnnotationMainWindow(QMainWindow):
         self._shortcut_bindings = load_shortcut_bindings()
         self._shortcut_sequences: dict[str, QKeySequence] = {}
         self._image_index_map: dict[Path, int] = {}
-        self._thumbnail_cache: dict[Path, QPixmap] = {}
+        self._thumbnail_cache: dict[Path, tuple[tuple[int, int], QPixmap]] = {}
         self._dataset_stats_baseline_counts: dict[str, int] = {}
         self._dataset_stats_total_images = 0
         self._dataset_stats_annotated_images = 0
@@ -183,9 +190,12 @@ class AnnotationMainWindow(QMainWindow):
         self._current_document_saved_box_count = 0
         self._current_document_saved_is_annotated = False
         self._dataset_loading = False
+        self._dataset_statistics_loading = False
         self._dataset_job_generation = 0
         self._thumbnail_job_generation = 0
         self._thumbnail_visible_paths: list[Path] = []
+        self._thumbnail_pending_paths: list[Path] = []
+        self._thumbnail_item_index_map: dict[Path, int] = {}
         self._thumbnail_icon_width = 128
         self._thumbnail_min_icon_width = 84
         self._thumbnail_max_icon_width = 256
@@ -194,6 +204,8 @@ class AnnotationMainWindow(QMainWindow):
         self._statistics_refresh_pending = False
         self._dataset_scan_thread: QThread | None = None
         self._dataset_scan_worker: DatasetScanWorker | None = None
+        self._dataset_statistics_thread: QThread | None = None
+        self._dataset_statistics_worker: DatasetStatisticsWorker | None = None
         self._thumbnail_thread: QThread | None = None
         self._thumbnail_worker: ThumbnailLoadWorker | None = None
         self._icons_dir = Path(__file__).resolve().parent.parent / "assets" / "icons"
@@ -240,6 +252,89 @@ class AnnotationMainWindow(QMainWindow):
         self._set_loaded_state(False)
         self._update_zoom_from_document()
         self._update_window_title()
+
+    def _apply_window_icon(self) -> None:
+        icon = self._asset_icon("app_logo.svg", "SP_ComputerIcon", "SP_DesktopIcon")
+        if icon.isNull():
+            return
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+
+    def _asset_icon(self, asset_name: str, *fallback_standard_pixmaps: str) -> QIcon:
+        candidate = self._icons_dir / asset_name
+        if candidate.exists():
+            icon = QIcon(str(candidate))
+            if not icon.isNull():
+                return icon
+
+        style = self.style()
+        for fallback_name in fallback_standard_pixmaps:
+            standard_pixmap = getattr(QStyle.StandardPixmap, fallback_name, None)
+            if standard_pixmap is None:
+                continue
+            icon = style.standardIcon(standard_pixmap)
+            if not icon.isNull():
+                return icon
+
+        return QIcon()
+
+    def _dialog_icon(self, level: str) -> QIcon:
+        standard_map = {
+            "info": QStyle.StandardPixmap.SP_MessageBoxInformation,
+            "warning": QStyle.StandardPixmap.SP_MessageBoxWarning,
+            "error": QStyle.StandardPixmap.SP_MessageBoxCritical,
+            "question": QStyle.StandardPixmap.SP_MessageBoxQuestion,
+        }
+        standard_pixmap = standard_map.get(level, QStyle.StandardPixmap.SP_MessageBoxInformation)
+        icon = self.style().standardIcon(standard_pixmap)
+        if not icon.isNull():
+            return icon
+        return self._asset_icon("app_logo.svg", "SP_ComputerIcon", "SP_DesktopIcon")
+
+    def _dialog_stylesheet(self) -> str:
+        return """
+QMessageBox {
+    background: #161d26;
+}
+
+QMessageBox QLabel {
+    color: #e7edf5;
+}
+
+QMessageBox QPushButton {
+    min-width: 84px;
+    padding: 6px 14px;
+}
+"""
+
+    def _localize_dialog_buttons(
+        self,
+        message_box: QMessageBox,
+        button_texts: dict[QMessageBox.StandardButton, str] | None,
+    ) -> None:
+        default_texts: dict[QMessageBox.StandardButton, str] = {
+            QMessageBox.StandardButton.Ok: "确定",
+            QMessageBox.StandardButton.Cancel: "取消",
+            QMessageBox.StandardButton.Yes: "是",
+            QMessageBox.StandardButton.No: "否",
+            QMessageBox.StandardButton.Save: "保存",
+            QMessageBox.StandardButton.Discard: "不保存",
+            QMessageBox.StandardButton.Close: "关闭",
+            QMessageBox.StandardButton.Retry: "重试",
+            QMessageBox.StandardButton.Ignore: "忽略",
+            QMessageBox.StandardButton.Abort: "中止",
+            QMessageBox.StandardButton.Apply: "应用",
+        }
+        for standard_button, default_text in default_texts.items():
+            button = message_box.button(standard_button)
+            if button is None:
+                continue
+            text = default_text
+            if button_texts is not None and standard_button in button_texts:
+                text = button_texts[standard_button]
+            button.setText(text)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -448,211 +543,61 @@ class AnnotationMainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        self.action_autosave = QAction("AUTO", self)
+        self.action_autosave.setCheckable(True)
+        self.action_autosave.toggled.connect(self.toggle_autosave)
+        self.action_autosave.setIcon(self._asset_icon("toolbar_autosave.svg", "SP_BrowserReload"))
+        self.action_autosave.setToolTip("自动保存")
+        self.action_autosave.setStatusTip("自动保存")
+        toolbar.addAction(self.action_autosave)
+
+        self.action_toggle_sidebar = QAction("侧栏", self)
+        self.action_toggle_sidebar.triggered.connect(self.toggle_sidebar)
+        self.action_toggle_sidebar.setIcon(self._asset_icon("toolbar_sidebar.svg", "SP_FileDialogDetailedView", "SP_FileDialogListView"))
+        self.action_toggle_sidebar.setToolTip("显示或隐藏侧栏")
+        self.action_toggle_sidebar.setStatusTip("显示或隐藏侧栏")
+        toolbar.addAction(self.action_toggle_sidebar)
+
+        toolbar.addSeparator()
+
         self.action_draw = QAction("新建标注", self)
         self.action_draw.setCheckable(True)
-        self.action_draw.triggered.connect(lambda checked: self.set_draw_mode(checked))
-        self.action_draw.setIcon(self._asset_icon("toolbar_draw.svg", "SP_FileDialogNewFolder", "SP_FileIcon"))
-        self.action_draw.setToolTip("新建标注（N）")
-        self.action_draw.setStatusTip("新建标注（N）")
+        self.action_draw.toggled.connect(self.set_draw_mode)
+        self.action_draw.setIcon(self._asset_icon("toolbar_draw.svg", "SP_DialogApplyButton", "SP_DialogYesButton"))
+        self.action_draw.setToolTip("切换到绘制模式")
+        self.action_draw.setStatusTip("切换到绘制模式")
         toolbar.addAction(self.action_draw)
 
         self.action_edit = QAction("编辑标注", self)
         self.action_edit.setCheckable(True)
-        self.action_edit.triggered.connect(lambda checked: self.set_edit_mode(checked))
-        self.action_edit.setIcon(
-            self._asset_icon("toolbar_edit.svg", "SP_FileDialogDetailedView", "SP_FileDialogContentsView")
-        )
-        self.action_edit.setToolTip("编辑标注（E）")
-        self.action_edit.setStatusTip("编辑标注（E）")
+        self.action_edit.toggled.connect(self.set_edit_mode)
+        self.action_edit.setIcon(self._asset_icon("toolbar_edit.svg", "SP_FileDialogContentsView", "SP_FileIcon"))
+        self.action_edit.setToolTip("切换到编辑模式")
+        self.action_edit.setStatusTip("切换到编辑模式")
         toolbar.addAction(self.action_edit)
 
         toolbar.addSeparator()
 
-        self.action_zoom_out = QAction("缩小", self)
-        self.action_zoom_out.triggered.connect(self.zoom_out)
-        self.action_zoom_out.setIcon(self._asset_icon("toolbar_zoom_out.svg", "SP_ArrowDown", "SP_DialogResetButton"))
-        self.action_zoom_out.setToolTip("缩小")
-        self.action_zoom_out.setStatusTip("缩小")
-        toolbar.addAction(self.action_zoom_out)
-
         self.action_zoom_in = QAction("放大", self)
         self.action_zoom_in.triggered.connect(self.zoom_in)
-        self.action_zoom_in.setIcon(self._asset_icon("toolbar_zoom_in.svg", "SP_ArrowUp", "SP_DialogApplyButton"))
+        self.action_zoom_in.setIcon(self._asset_icon("toolbar_zoom_in.svg", "SP_ArrowUp", "SP_ArrowForward"))
         self.action_zoom_in.setToolTip("放大")
         self.action_zoom_in.setStatusTip("放大")
         toolbar.addAction(self.action_zoom_in)
 
-        self.action_fit = QAction("适配窗口", self)
+        self.action_zoom_out = QAction("缩小", self)
+        self.action_zoom_out.triggered.connect(self.zoom_out)
+        self.action_zoom_out.setIcon(self._asset_icon("toolbar_zoom_out.svg", "SP_ArrowDown", "SP_ArrowBack"))
+        self.action_zoom_out.setToolTip("缩小")
+        self.action_zoom_out.setStatusTip("缩小")
+        toolbar.addAction(self.action_zoom_out)
+
+        self.action_fit = QAction("适应窗口", self)
         self.action_fit.triggered.connect(self.fit_to_window)
-        self.action_fit.setIcon(self._asset_icon("toolbar_fit.svg", "SP_TitleBarMaxButton", "SP_DesktopIcon"))
-        self.action_fit.setToolTip("适配窗口")
-        self.action_fit.setStatusTip("适配窗口")
+        self.action_fit.setIcon(self._asset_icon("toolbar_fit.svg", "SP_DialogResetButton", "SP_BrowserReload"))
+        self.action_fit.setToolTip("适应窗口")
+        self.action_fit.setStatusTip("适应窗口")
         toolbar.addAction(self.action_fit)
-
-        toolbar.addSeparator()
-
-        assert self.sidebar_dock is not None
-        toggle_action = self.sidebar_dock.toggleViewAction()
-        assert toggle_action is not None
-        self.action_toggle_sidebar = toggle_action
-        self.action_toggle_sidebar.setShortcut("Ctrl+B")
-        self.action_toggle_sidebar.setIcon(
-            self._asset_icon("toolbar_sidebar.svg", "SP_ToolBarHorizontalExtensionButton", "SP_DesktopIcon")
-        )
-        self.action_toggle_sidebar.setToolTip("显示/隐藏侧边栏（Ctrl+B）")
-        self.action_toggle_sidebar.setStatusTip("显示/隐藏侧边栏（Ctrl+B）")
-        toolbar.addAction(self.action_toggle_sidebar)
-
-        self.action_autosave = QAction("自动保存", self)
-        self.action_autosave.setCheckable(True)
-        self.action_autosave.setChecked(self._autosave_enabled_pref)
-        self.action_autosave.triggered.connect(self.toggle_autosave)
-        self.action_autosave.setIcon(self._asset_icon("toolbar_autosave.svg", "SP_DialogApplyButton", "SP_DialogYesButton"))
-        self.action_autosave.setToolTip("启用/关闭自动保存")
-        self.action_autosave.setStatusTip("启用/关闭自动保存")
-        toolbar.addAction(self.action_autosave)
-
-        self._apply_shortcuts_to_actions()
-
-    def _asset_icon(self, filename: str, *fallback_names: str) -> QIcon:
-        path = self._icons_dir / filename
-        if path.exists():
-            return QIcon(str(path))
-        return self._standard_icon(*fallback_names)
-
-    def _recommended_parallel_workers(self, task_count: int) -> int:
-        if task_count <= 0:
-            return 1
-        logical_cores = os.cpu_count() or 4
-        # I/O dominated tasks benefit from a slightly wider pool than CPU count.
-        return max(2, min(12, task_count, logical_cores * 2))
-
-    def _standard_icon(self, *names: str) -> QIcon:
-        style = self.style()
-        if style is None:
-            return QIcon()
-        for name in names:
-            enum_value = getattr(QStyle.StandardPixmap, name, None)
-            if enum_value is not None:
-                return style.standardIcon(enum_value)
-        return QIcon()
-
-    def _apply_window_icon(self) -> None:
-        self.setWindowIcon(self._asset_icon("app_logo.svg", "SP_DesktopIcon", "SP_ComputerIcon"))
-
-    def _apply_sidebar_tab_icons(self) -> None:
-        for tab_id in self._sidebar_tab_order:
-            index = self._sidebar_tab_index_by_id.get(tab_id)
-            if index is None:
-                continue
-            icon_name, fallback_1, fallback_2 = self._sidebar_tab_icons[tab_id]
-            tip = self._sidebar_tab_tooltips[tab_id]
-            icon = self._asset_icon(icon_name, fallback_1, fallback_2)
-            self.sidebar_tabs.setTabIcon(index, icon)
-            self.sidebar_tabs.setTabToolTip(index, tip)
-
-    def _dialog_stylesheet(self) -> str:
-        return """
-        QMessageBox {
-            background-color: #101925;
-        }
-        QMessageBox QLabel {
-            color: #e8f1ff;
-        }
-        QMessageBox QLabel#qt_msgbox_label {
-            min-width: 340px;
-            max-width: 560px;
-            font-size: 14px;
-            font-weight: 600;
-            line-height: 1.3;
-        }
-        QMessageBox QLabel#qt_msgbox_informativelabel {
-            min-width: 340px;
-            max-width: 560px;
-            margin-top: 3px;
-            color: #b8c8da;
-            font-size: 12px;
-            font-weight: 400;
-            line-height: 1.3;
-        }
-        QMessageBox QLabel#qt_msgboxex_icon_label {
-            min-width: 22px;
-            max-width: 22px;
-            min-height: 22px;
-            max-height: 22px;
-            margin-right: 6px;
-        }
-        QMessageBox QPushButton {
-            min-width: 92px;
-            padding: 6px 14px;
-            border-radius: 6px;
-            border: 1px solid #2d435a;
-            background-color: #1a2d42;
-            color: #eef5ff;
-        }
-        QMessageBox QPushButton:hover {
-            border-color: #63b1ff;
-            background-color: #234668;
-        }
-        QMessageBox QPushButton:default {
-            border-color: #78c1ff;
-            background-color: #2d5882;
-        }
-        QMessageBox QTextEdit {
-            background-color: #0d1520;
-            border: 1px solid #2d435a;
-            color: #d6e6f7;
-            min-height: 120px;
-        }
-        """
-
-    def _dialog_icon(self, level: str) -> QIcon:
-        if level == "warning":
-            return self._asset_icon("dialog_warning.svg", "SP_MessageBoxWarning", "SP_MessageBoxQuestion")
-        if level == "error":
-            return self._asset_icon("dialog_error.svg", "SP_MessageBoxCritical", "SP_MessageBoxWarning")
-        if level == "question":
-            return self._asset_icon("dialog_question.svg", "SP_MessageBoxQuestion", "SP_MessageBoxInformation")
-        return self._asset_icon("dialog_info.svg", "SP_MessageBoxInformation", "SP_FileDialogInfoView")
-
-    def _default_dialog_title(self, level: str) -> str:
-        if level == "warning":
-            return "请注意"
-        if level == "error":
-            return "操作失败"
-        if level == "question":
-            return "请确认"
-        return "提示"
-
-    def _localize_dialog_buttons(
-        self,
-        message_box: QMessageBox,
-        overrides: dict[QMessageBox.StandardButton, str] | None = None,
-    ) -> None:
-        labels: dict[QMessageBox.StandardButton, str] = {
-            QMessageBox.StandardButton.Ok: "确定",
-            QMessageBox.StandardButton.Yes: "是",
-            QMessageBox.StandardButton.No: "否",
-            QMessageBox.StandardButton.Cancel: "取消",
-            QMessageBox.StandardButton.Save: "保存",
-            QMessageBox.StandardButton.Discard: "不保存",
-            QMessageBox.StandardButton.Apply: "应用",
-            QMessageBox.StandardButton.Close: "关闭",
-            QMessageBox.StandardButton.Open: "打开",
-            QMessageBox.StandardButton.Retry: "重试",
-            QMessageBox.StandardButton.Ignore: "忽略",
-            QMessageBox.StandardButton.Abort: "中止",
-            QMessageBox.StandardButton.Reset: "重置",
-            QMessageBox.StandardButton.RestoreDefaults: "恢复默认",
-            QMessageBox.StandardButton.Help: "帮助",
-        }
-        if overrides:
-            labels.update(overrides)
-
-        for standard_button, text in labels.items():
-            button = message_box.button(standard_button)
-            if button is not None:
-                button.setText(text)
 
     def _show_dialog(
         self,
@@ -667,19 +612,17 @@ class AnnotationMainWindow(QMainWindow):
         button_texts: dict[QMessageBox.StandardButton, str] | None = None,
     ) -> QMessageBox.StandardButton:
         message_box = QMessageBox(self)
-        message_box.setWindowTitle((title or "").strip() or self._default_dialog_title(level))
-        message_box.setText(str(text).strip())
-        message_box.setTextFormat(Qt.TextFormat.PlainText)
+        message_box.setWindowTitle(title)
+        message_box.setText(text)
         if informative_text:
-            message_box.setInformativeText(str(informative_text).strip())
+            message_box.setInformativeText(informative_text)
         if details:
-            message_box.setDetailedText(str(details).strip())
+            message_box.setDetailedText(details)
         message_box.setStandardButtons(buttons)
         if default_button is not None:
-            try:
-                message_box.setDefaultButton(default_button)
-            except Exception:
-                pass
+            default_widget = message_box.button(default_button)
+            if default_widget is not None:
+                message_box.setDefaultButton(default_widget)
 
         message_box.setIcon(QMessageBox.Icon.NoIcon)
         icon = self._dialog_icon(level)
@@ -953,6 +896,19 @@ class AnnotationMainWindow(QMainWindow):
         for tab_id, action in self._sidebar_tab_toggle_actions.items():
             with QSignalBlocker(action):
                 action.setChecked(bool(self._sidebar_tab_visibility.get(tab_id, False)))
+
+    def _apply_sidebar_tab_icons(self) -> None:
+        tab_bar = self.sidebar_tabs.tabBar()
+        assert tab_bar is not None
+
+        for tab_id, icon_spec in self._sidebar_tab_icons.items():
+            tab_index = self._sidebar_tab_index_by_id.get(tab_id)
+            if tab_index is None:
+                continue
+            asset_name, *fallback_standard_pixmaps = icon_spec
+            icon = self._asset_icon(asset_name, *fallback_standard_pixmaps)
+            if not icon.isNull():
+                tab_bar.setTabIcon(tab_index, icon)
 
     def _apply_sidebar_tab_visibility(self, preferred_tab_id: str | None = None) -> None:
         tab_bar = self.sidebar_tabs.tabBar()
@@ -1454,7 +1410,7 @@ class AnnotationMainWindow(QMainWindow):
         dataset_tools_section.content_layout_ref().addLayout(extract_form)
 
         dataset_tools_hint = QLabel(
-            "抽取功能按 train/val/test 分别采样，并尽量保持各类别比例；划分功能会打开 tools/dataset_splitter.html。"
+            "抽取功能按 train/val/test 分别采样，并尽量保持各类别比例；抽取时可按 ID / 名称勾选需要保留的类别；划分功能会打开 tools/dataset_splitter.html。"
         )
         dataset_tools_hint.setObjectName("mutedLabel")
         dataset_tools_hint.setWordWrap(True)
@@ -1801,11 +1757,14 @@ class AnnotationMainWindow(QMainWindow):
             self._set_status_message("数据集正在加载，请稍候...")
             return
 
+        self._cancel_dataset_statistics_loading()
+        self._cancel_thumbnail_loading()
         self._dataset_job_generation += 1
         job_id = self._dataset_job_generation
         self._pending_dataset_root = root
         self._pending_dataset_preferred_path = preferred_path
         self._dataset_loading = True
+        self._dataset_statistics_loading = True
         self._set_loaded_state(False)
         self._set_statistics_loading_state("正在统计数据...")
         self._set_status_message(f"正在加载数据集: {root}")
@@ -2265,6 +2224,65 @@ class AnnotationMainWindow(QMainWindow):
 
         return items, class_totals
 
+    def _filter_extract_items_by_class_ids(
+        self,
+        items: list[ExtractDatasetItem],
+        selected_class_ids: set[int],
+    ) -> tuple[list[ExtractDatasetItem], dict[int, int]]:
+        selected_ids = {int(class_id) for class_id in selected_class_ids}
+        filtered_items: list[ExtractDatasetItem] = []
+        filtered_totals: dict[int, int] = {}
+
+        for item in items:
+            class_counts = {
+                class_id: int(count)
+                for class_id, count in item.class_counts.items()
+                if class_id in selected_ids
+            }
+            if not class_counts:
+                continue
+
+            filtered_items.append(
+                ExtractDatasetItem(
+                    image_path=item.image_path,
+                    label_path=item.label_path,
+                    relative_path=item.relative_path,
+                    class_counts=class_counts,
+                )
+            )
+            for class_id, count in class_counts.items():
+                filtered_totals[class_id] = filtered_totals.get(class_id, 0) + int(count)
+
+        return filtered_items, filtered_totals
+
+    def _write_filtered_extract_label(
+        self,
+        source_label_path: Path,
+        target_label_path: Path,
+        selected_class_ids: set[int],
+    ) -> None:
+        selected_ids = {int(class_id) for class_id in selected_class_ids}
+        filtered_lines: list[str] = []
+
+        for raw_line in source_label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+
+            parts = stripped.split()
+            if len(parts) < 5:
+                continue
+
+            try:
+                class_id = int(float(parts[0]))
+            except Exception:
+                continue
+
+            if class_id in selected_ids:
+                filtered_lines.append(raw_line)
+
+        target_label_path.write_text("\n".join(filtered_lines), encoding="utf-8")
+
     def _sample_extract_items_with_ratio(
         self,
         items: list[ExtractDatasetItem],
@@ -2404,11 +2422,58 @@ class AnnotationMainWindow(QMainWindow):
             source_items[split_name] = items
             source_class_totals[split_name] = class_totals
 
+        source_manager = ClassManager()
+        source_manager.load_from_root(source_root)
+
+        observed_class_ids: set[int] = set()
+        for class_totals in source_class_totals.values():
+            observed_class_ids.update(class_totals.keys())
+
+        selected_class_ids: set[int] | None = None
+        available_class_ids = sorted(observed_class_ids)
+        if available_class_ids:
+            class_items = [
+                (class_id, source_manager.get_name(class_id) or f"ID {class_id}")
+                for class_id in available_class_ids
+            ]
+            selected_ids, accepted = ClassChecklistDialog.get_selected_class_ids(
+                self,
+                class_items,
+                default_checked_ids=set(available_class_ids),
+                title="选择抽取类别",
+                prompt="勾选需要抽取的类别：",
+            )
+            if not accepted:
+                return
+
+            selected_class_ids = {int(class_id) for class_id in selected_ids}
+            if not selected_class_ids:
+                self._info_dialog("抽取结果", "未选择任何类别。")
+                return
+
+            if selected_class_ids == set(available_class_ids):
+                selected_class_ids = None
+
+        effective_items: dict[str, list[ExtractDatasetItem]] = {}
+        effective_class_totals: dict[str, dict[int, int]] = {}
+        for split_name in splits:
+            if selected_class_ids is None:
+                effective_items[split_name] = list(source_items[split_name])
+                effective_class_totals[split_name] = dict(source_class_totals[split_name])
+                continue
+
+            filtered_items, filtered_totals = self._filter_extract_items_by_class_ids(
+                source_items[split_name],
+                selected_class_ids,
+            )
+            effective_items[split_name] = filtered_items
+            effective_class_totals[split_name] = filtered_totals
+
         sampled_items: dict[str, list[ExtractDatasetItem]] = {}
         for split_index, split_name in enumerate(splits):
             sampled_items[split_name] = self._sample_extract_items_with_ratio(
-                source_items[split_name],
-                source_class_totals[split_name],
+                effective_items[split_name],
+                effective_class_totals[split_name],
                 sample_ratio,
                 seed=random_seed + split_index * 1009,
             )
@@ -2449,7 +2514,10 @@ class AnnotationMainWindow(QMainWindow):
 
                 if item.label_path is not None and item.label_path.exists():
                     output_label_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(item.label_path, output_label_path)
+                    if selected_class_ids is None:
+                        shutil.copy2(item.label_path, output_label_path)
+                    else:
+                        self._write_filtered_extract_label(item.label_path, output_label_path, selected_class_ids)
 
                 copied_items[split_name].append(item)
                 copied += 1
@@ -2462,14 +2530,15 @@ class AnnotationMainWindow(QMainWindow):
         progress.setValue(copied)
         progress.close()
 
-        source_manager = ClassManager()
-        source_manager.load_from_root(source_root)
-        class_mapping = dict(source_manager.id_to_name)
+        export_class_ids = available_class_ids if selected_class_ids is None else sorted(selected_class_ids)
+        if not export_class_ids:
+            export_class_ids = sorted(source_manager.id_to_name.keys())
+        class_mapping = {
+            class_id: source_manager.get_name(class_id) or f"ID {class_id}"
+            for class_id in export_class_ids
+        }
         if not class_mapping:
-            observed_ids: set[int] = set()
-            for split_name in splits:
-                observed_ids.update(source_class_totals[split_name].keys())
-            class_mapping = {class_id: f"ID {class_id}" for class_id in sorted(observed_ids)}
+            class_mapping = {class_id: f"ID {class_id}" for class_id in sorted(observed_class_ids)}
 
         if layout_mode == "split_nested":
             train_path, val_path, test_path = "train/images", "val/images", "test/images"
@@ -2491,12 +2560,13 @@ class AnnotationMainWindow(QMainWindow):
             f"识别结构：{self._extract_layout_caption(layout_mode)}",
             f"抽取比例：{ratio_percent}%",
             f"随机种子：{random_seed}",
+            f"类别筛选：{'全部类别' if selected_class_ids is None else f'已选 {len(selected_class_ids)} 类'}",
             "",
         ]
         for split_name in splits:
             before_images = len(source_items[split_name])
             after_images = len(copied_items[split_name])
-            before_counts = source_class_totals[split_name]
+            before_counts = effective_class_totals[split_name]
             after_counts = self._aggregate_extract_class_counts(copied_items[split_name])
             before_total = sum(before_counts.values())
             after_total = sum(after_counts.values())
@@ -2806,24 +2876,28 @@ class AnnotationMainWindow(QMainWindow):
         self._refresh_thumbnail_list()
 
     def _refresh_image_list(self) -> None:
-        with QSignalBlocker(self.image_list_widget):
-            self.image_list_widget.clear()
-            for path in self.dataset_service.image_paths:
-                display = self.dataset_service.display_name(path)
-                if self._image_filter_text and self._image_filter_text not in display.lower():
-                    continue
-                item = QListWidgetItem(display)
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                item.setToolTip(str(path))
-                self.image_list_widget.addItem(item)
+        self.image_list_widget.setUpdatesEnabled(False)
+        try:
+            with QSignalBlocker(self.image_list_widget):
+                self.image_list_widget.clear()
+                for path in self.dataset_service.image_paths:
+                    display = self.dataset_service.display_name(path)
+                    if self._image_filter_text and self._image_filter_text not in display.lower():
+                        continue
+                    item = QListWidgetItem(display)
+                    item.setData(Qt.ItemDataRole.UserRole, path)
+                    item.setToolTip(str(path))
+                    self.image_list_widget.addItem(item)
 
-            if self.current_document is not None:
-                current_path = self.current_document.image_path
-                for row in range(self.image_list_widget.count()):
-                    item = self.image_list_widget.item(row)
-                    if item and item.data(Qt.ItemDataRole.UserRole) == current_path:
-                        self.image_list_widget.setCurrentRow(row)
-                        break
+                if self.current_document is not None:
+                    current_path = self.current_document.image_path
+                    for row in range(self.image_list_widget.count()):
+                        item = self.image_list_widget.item(row)
+                        if item and item.data(Qt.ItemDataRole.UserRole) == current_path:
+                            self.image_list_widget.setCurrentRow(row)
+                            break
+        finally:
+            self.image_list_widget.setUpdatesEnabled(True)
 
     def _refresh_thumbnail_list(self, *, force: bool = False) -> None:
         if not hasattr(self, "thumbnail_list_widget"):
@@ -2836,24 +2910,40 @@ class AnnotationMainWindow(QMainWindow):
         self._thumbnail_refresh_pending = False
 
         visible_paths: list[Path] = []
+        pending_paths: list[Path] = []
+        item_index_map: dict[Path, int] = {}
         self.thumbnail_list_widget.setUpdatesEnabled(False)
-        with QSignalBlocker(self.thumbnail_list_widget):
-            self.thumbnail_list_widget.clear()
-            for path in self.dataset_service.image_paths:
-                display = self.dataset_service.display_name(path)
-                if self._image_filter_text and self._image_filter_text not in display.lower():
-                    continue
-                visible_paths.append(path)
-                item = QListWidgetItem(display)
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                item.setToolTip(str(path))
-                item.setIcon(QIcon(self._thumbnail_icon_placeholder()))
-                self.thumbnail_list_widget.addItem(item)
-        self.thumbnail_list_widget.setUpdatesEnabled(True)
+        try:
+            with QSignalBlocker(self.thumbnail_list_widget):
+                self.thumbnail_list_widget.clear()
+                for path in self.dataset_service.image_paths:
+                    display = self.dataset_service.display_name(path)
+                    if self._image_filter_text and self._image_filter_text not in display.lower():
+                        continue
+
+                    visible_paths.append(path)
+                    item_index = len(visible_paths) - 1
+                    item_index_map[path] = item_index
+                    item = QListWidgetItem(display)
+                    item.setData(Qt.ItemDataRole.UserRole, path)
+                    item.setToolTip(str(path))
+
+                    signature = self._thumbnail_signature(path)
+                    cached = self._thumbnail_cache.get(path)
+                    if cached is not None and signature is not None and cached[0] == signature:
+                        item.setIcon(QIcon(cached[1]))
+                    else:
+                        item.setIcon(QIcon(self._thumbnail_icon_placeholder()))
+                        pending_paths.append(path)
+                    self.thumbnail_list_widget.addItem(item)
+        finally:
+            self.thumbnail_list_widget.setUpdatesEnabled(True)
 
         self._thumbnail_visible_paths = visible_paths
+        self._thumbnail_pending_paths = pending_paths
+        self._thumbnail_item_index_map = item_index_map
         self._sync_thumbnail_selection()
-        self._start_thumbnail_loading(visible_paths)
+        self._start_thumbnail_loading(pending_paths)
 
     def _cancel_thumbnail_loading(self) -> None:
         worker = self._thumbnail_worker
@@ -2872,6 +2962,13 @@ class AnnotationMainWindow(QMainWindow):
         placeholder.fill(Qt.GlobalColor.darkGray)
         return placeholder
 
+    def _thumbnail_signature(self, path: Path) -> tuple[int, int] | None:
+        try:
+            stat_result = path.stat()
+        except Exception:
+            return None
+        return stat_result.st_mtime_ns, stat_result.st_size
+
     def _start_thumbnail_loading(self, visible_paths: list[Path]) -> None:
         self._cancel_thumbnail_loading()
         self._thumbnail_job_generation += 1
@@ -2882,7 +2979,9 @@ class AnnotationMainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.thumbnailReady.connect(lambda index, image, job=job_id: self._on_thumbnail_ready(job, index, image))
+        worker.thumbnailReady.connect(
+            lambda index, image, signature, job=job_id: self._on_thumbnail_ready(job, index, image, signature)
+        )
         worker.progressChanged.connect(lambda current, total, job=job_id: self._on_thumbnail_progress(job, current, total))
         worker.finished.connect(lambda job=job_id: self._on_thumbnail_finished(job))
         worker.failed.connect(lambda message, job=job_id: self._on_thumbnail_failed(job, message))
@@ -2894,20 +2993,26 @@ class AnnotationMainWindow(QMainWindow):
         self._thumbnail_thread = thread
         thread.start()
 
-    def _on_thumbnail_ready(self, job_id: int, index: int, thumbnail_image) -> None:
+    def _on_thumbnail_ready(self, job_id: int, index: int, thumbnail_image, signature) -> None:
         if job_id != self._thumbnail_job_generation:
             return
+        if index < 0 or index >= len(self._thumbnail_pending_paths):
+            return
+        path = self._thumbnail_pending_paths[index]
+        pixmap = QPixmap.fromImage(thumbnail_image)
+        if isinstance(signature, tuple) and len(signature) == 2:
+            self._thumbnail_cache[path] = (signature, pixmap)
+        else:
+            self._thumbnail_cache[path] = ((0, 0), pixmap)
+
         if not self._is_thumbnail_panel_visible():
             return
-        if index < 0 or index >= len(self._thumbnail_visible_paths):
+        item_index = self._thumbnail_item_index_map.get(path)
+        if item_index is None or item_index < 0 or item_index >= self.thumbnail_list_widget.count():
             return
-        path = self._thumbnail_visible_paths[index]
-        pixmap = QPixmap.fromImage(thumbnail_image)
-        self._thumbnail_cache[path] = pixmap
-        if index < self.thumbnail_list_widget.count():
-            item = self.thumbnail_list_widget.item(index)
-            if item is not None:
-                item.setIcon(QIcon(pixmap))
+        item = self.thumbnail_list_widget.item(item_index)
+        if item is not None:
+            item.setIcon(QIcon(pixmap))
 
     def _on_thumbnail_progress(self, job_id: int, current: int, total: int) -> None:
         if job_id != self._thumbnail_job_generation:
@@ -3767,6 +3872,10 @@ class AnnotationMainWindow(QMainWindow):
         if not hasattr(self, "dataset_statistics_widget"):
             return
 
+        if self._dataset_statistics_loading:
+            self._set_statistics_loading_state("正在统计数据...")
+            return
+
         if not force and not self._is_statistics_panel_visible():
             self._statistics_refresh_pending = True
             return
@@ -3801,7 +3910,7 @@ class AnnotationMainWindow(QMainWindow):
                 updated.pop(class_name, None)
         return updated
 
-    def _store_dataset_statistics_baseline(self, result: DatasetLoadResult) -> None:
+    def _store_dataset_statistics_baseline(self, result: DatasetStatisticsResult) -> None:
         self._dataset_stats_baseline_counts = dict(result.class_counts)
         self._dataset_stats_total_images = int(result.total_images)
         self._dataset_stats_annotated_images = int(result.annotated_images)
@@ -3826,7 +3935,7 @@ class AnnotationMainWindow(QMainWindow):
             return
         self._set_status_message(f"正在加载数据集... {current}/{total}")
 
-    def _on_dataset_scan_finished(self, job_id: int, result: DatasetLoadResult) -> None:
+    def _on_dataset_scan_finished(self, job_id: int, result: DatasetScanResult) -> None:
         if job_id != self._dataset_job_generation:
             return
 
@@ -3836,11 +3945,10 @@ class AnnotationMainWindow(QMainWindow):
         if previous_root is None or previous_root != Path(result.root_dir):
             self._dataset_delete_undo_stack.clear()
             self._dataset_delete_redo_stack.clear()
+            self._thumbnail_cache.clear()
         self.class_manager.load_from_root(result.root_dir)
-        self._store_dataset_statistics_baseline(result)
         self.history.clear()
         self.history.clear_pending()
-        self._thumbnail_cache = {}
         self._image_index_map = {path: index for index, path in enumerate(self.dataset_service.image_paths)}
         self._image_filter_text = ""
         self.image_filter_edit.blockSignals(True)
@@ -3851,6 +3959,8 @@ class AnnotationMainWindow(QMainWindow):
         self._refresh_class_widgets()
         self._refresh_image_list()
         self._refresh_thumbnail_list()
+
+        self._start_dataset_statistics_loading(job_id, result)
 
         if self.dataset_service.image_paths:
             if self._pending_dataset_preferred_path is not None and self._pending_dataset_preferred_path in self._image_index_map:
@@ -3869,9 +3979,66 @@ class AnnotationMainWindow(QMainWindow):
         if job_id != self._dataset_job_generation:
             return
         self._dataset_loading = False
+        self._dataset_statistics_loading = False
+        self._dataset_statistics_worker = None
+        self._dataset_statistics_thread = None
         self._set_loaded_state(bool(self.dataset_service.image_paths))
         self._set_statistics_loading_state("数据加载失败")
         self._set_status_message(f"数据集加载失败：{message}")
+
+    def _start_dataset_statistics_loading(self, job_id: int, result: DatasetScanResult) -> None:
+        self._cancel_dataset_statistics_loading()
+        self._dataset_statistics_loading = True
+        self._set_statistics_loading_state("正在统计数据...")
+
+        worker = DatasetStatisticsWorker(result, dict(self.class_manager.id_to_name))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progressChanged.connect(
+            lambda current, total, job=job_id: self._on_dataset_statistics_progress(job, current, total)
+        )
+        worker.finished.connect(lambda statistics, job=job_id: self._on_dataset_statistics_finished(job, statistics))
+        worker.failed.connect(lambda message, job=job_id: self._on_dataset_statistics_failed(job, message))
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._dataset_statistics_worker = worker
+        self._dataset_statistics_thread = thread
+        thread.start()
+
+    def _cancel_dataset_statistics_loading(self) -> None:
+        worker = self._dataset_statistics_worker
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+
+    def _on_dataset_statistics_progress(self, job_id: int, current: int, total: int) -> None:
+        if job_id != self._dataset_job_generation:
+            return
+        self._set_status_message(f"正在统计数据... {current}/{total}")
+
+    def _on_dataset_statistics_finished(self, job_id: int, result: DatasetStatisticsResult) -> None:
+        if job_id != self._dataset_job_generation:
+            return
+
+        self._dataset_statistics_loading = False
+        self._dataset_statistics_worker = None
+        self._dataset_statistics_thread = None
+        self._store_dataset_statistics_baseline(result)
+        self._update_dataset_statistics_widget(force=True)
+
+    def _on_dataset_statistics_failed(self, job_id: int, message: str) -> None:
+        if job_id != self._dataset_job_generation:
+            return
+
+        self._dataset_statistics_loading = False
+        self._dataset_statistics_worker = None
+        self._dataset_statistics_thread = None
+        self._set_status_message(f"数据统计失败：{message}")
 
     def _sync_history_actions(self) -> None:
         has_document = self.current_document is not None

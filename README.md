@@ -38,11 +38,13 @@ pip install PyQt6 numpy opencv-python pyyaml
 
 ## 启动方式
 
-在项目根目录执行命令：
+在项目根目录执行任一命令：
 
 ```bash
 python -m labeltool
 ```
+
+不要使用 `showme2.py`，当前工作区里没有这个启动脚本。
 
 ## 基本使用流程
 
@@ -80,6 +82,16 @@ labeltool/
 │  └─ ui/                       # 界面与交互层
 └─ README.md
 ```
+
+## 常见问题
+
+### 为什么直接运行 main_window.py 会失败？
+
+`main_window.py` 依赖应用初始化上下文（样式、应用级设置、入口装配），请通过：
+
+- `python -m labeltool`
+
+启动。
 
 ## 免责声明
 

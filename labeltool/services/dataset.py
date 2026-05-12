@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -25,16 +26,31 @@ class DatasetService:
         if not root.exists():
             return self.image_paths
 
-        for path in root.rglob("*"):
-            if not path.is_file() or self._should_ignore(path):
-                continue
+        ignored_dirnames = {
+            ".git",
+            "__pycache__",
+            ".venv",
+            "venv",
+            "env",
+            "node_modules",
+            "build",
+            "dist",
+        }
 
-            suffix = path.suffix.lower()
-            if suffix in IMAGE_EXTENSIONS:
-                self.image_paths.append(path)
-            elif suffix in LABEL_EXTENSIONS:
-                self.label_paths.append(path)
-                self._label_index[path.stem.lower()].append(path)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [dirname for dirname in dirnames if dirname not in ignored_dirnames]
+            current_dir = Path(dirpath)
+            for filename in filenames:
+                path = current_dir / filename
+                if self._should_ignore(path):
+                    continue
+
+                suffix = path.suffix.lower()
+                if suffix in IMAGE_EXTENSIONS:
+                    self.image_paths.append(path)
+                elif suffix in LABEL_EXTENSIONS:
+                    self.label_paths.append(path)
+                    self._label_index[path.stem.lower()].append(path)
 
         self.image_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
         self.label_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
