@@ -197,8 +197,8 @@
                     </div>
                     <div>
                         <label for="label-extensions" class="mb-1 block text-sm font-medium text-slate-700">标注文件扩展名</label>
-                        <input id="label-extensions" type="text" value="xml,txt,json" class="w-full rounded-lg border border-slate-300 px-4 py-2 outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                        <p class="mt-1 text-xs text-slate-500">用逗号分隔，例如: xml,txt</p>
+                        <input id="label-extensions" type="text" value="xml,txt,json,png" class="w-full rounded-lg border border-slate-300 px-4 py-2 outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
+                        <p class="mt-1 text-xs text-slate-500">用逗号分隔，例如: xml,txt,json,png；mask PNG 支持 images/labels 分目录或同目录 *_mask.png 等命名</p>
                     </div>
                 </div>
             </section>
@@ -318,6 +318,16 @@
         let allFilePairs = [];
         let classificationSamplesByClass = new Map();
         const COPY_CONCURRENCY = Math.max(2, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+        const IMAGE_DIRECTORY_NAMES = new Set(['image', 'images', 'img', 'imgs', 'jpegimages']);
+        const LABEL_DIRECTORY_NAMES = new Set([
+            'label', 'labels', 'mask', 'masks', 'annotation', 'annotations', 'ann', 'anns',
+            'seg', 'segs', 'segmentation', 'segmentations', 'semantic', 'semantic_masks',
+        ]);
+        const MASK_LABEL_SUFFIXES = [
+            '_segmentation', '-segmentation', '_mask_label', '-mask-label', '_semantic', '-semantic',
+            '_labels', '-labels', '_label', '-label', '_masks', '-masks', '_mask', '-mask',
+            '_seg', '-seg',
+        ];
 
         function setTypeButtonState(button, active) {
             button.classList.toggle('border-primary', active);
@@ -329,7 +339,10 @@
         }
 
         function parseExtensions(value) {
-            return value.split(',').map(item => item.trim()).filter(Boolean);
+            return value
+                .split(',')
+                .map(item => item.trim().replace(/^\./, '').toLowerCase())
+                .filter(Boolean);
         }
 
         function naturalCompare(leftValue, rightValue) {
@@ -616,51 +629,341 @@
             }
         }
 
+        function getFileNameParts(fileName) {
+            const nameParts = fileName.split('.');
+            if (nameParts.length < 2) {
+                return null;
+            }
+
+            const ext = nameParts.pop().toLowerCase();
+            const baseName = nameParts.join('.');
+            if (!baseName || !ext) {
+                return null;
+            }
+
+            return { baseName, ext };
+        }
+
+        function normalizeRelativePath(value) {
+            return String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        }
+
+        function splitRelativePath(value) {
+            const normalized = normalizeRelativePath(value);
+            return normalized ? normalized.split('/').filter(Boolean) : [];
+        }
+
+        function joinRelativePath(relativeDir, fileName) {
+            return relativeDir ? `${relativeDir}/${fileName}` : fileName;
+        }
+
+        function normalizeMatchKey(value) {
+            return normalizeRelativePath(value).toLowerCase();
+        }
+
+        function getStemPath(record, baseName = record.baseName) {
+            return record.dir ? `${record.dir}/${baseName}` : baseName;
+        }
+
+        function hasDirectoryRole(relativeDir, roleNames) {
+            return splitRelativePath(relativeDir)
+                .some(segment => roleNames.has(segment.toLowerCase()));
+        }
+
+        function stripLeadingRoleDirectory(stemPath, roleNames) {
+            const segments = splitRelativePath(stemPath);
+            if (segments.length > 1 && roleNames.has(segments[0].toLowerCase())) {
+                return segments.slice(1).join('/');
+            }
+            return normalizeRelativePath(stemPath);
+        }
+
+        function stripMaskSuffix(baseName) {
+            const lowerBaseName = baseName.toLowerCase();
+            for (const suffix of MASK_LABEL_SUFFIXES) {
+                if (lowerBaseName.endsWith(suffix) && baseName.length > suffix.length) {
+                    return baseName.slice(0, -suffix.length);
+                }
+            }
+            return baseName;
+        }
+
+        function hasMaskLabelSuffix(baseName) {
+            return stripMaskSuffix(baseName) !== baseName;
+        }
+
+        function getPathMatchKeys(record, roleNames, baseName = record.baseName) {
+            const stemPath = getStemPath(record, baseName);
+            return Array.from(new Set([
+                normalizeMatchKey(stemPath),
+                normalizeMatchKey(stripLeadingRoleDirectory(stemPath, roleNames)),
+            ].filter(Boolean)));
+        }
+
+        function getRecordMatchKeys(record, roleNames, baseName = record.baseName) {
+            return Array.from(new Set([
+                ...getPathMatchKeys(record, roleNames, baseName),
+                normalizeMatchKey(baseName),
+            ].filter(Boolean)));
+        }
+
+        function recordsShareLogicalStem(leftRecord, leftRoleNames, rightRecord, rightRoleNames) {
+            const leftKeys = new Set(getPathMatchKeys(leftRecord, leftRoleNames));
+            return getPathMatchKeys(rightRecord, rightRoleNames).some(key => leftKeys.has(key));
+        }
+
+        async function collectFileRecords(directoryHandle, relativeDir = '', records = []) {
+            for await (const entry of directoryHandle.values()) {
+                const relativePath = joinRelativePath(relativeDir, entry.name);
+                if (entry.kind === 'directory') {
+                    await collectFileRecords(entry, relativePath, records);
+                    continue;
+                }
+
+                if (entry.kind !== 'file') {
+                    continue;
+                }
+
+                const parts = getFileNameParts(entry.name);
+                if (!parts) {
+                    continue;
+                }
+
+                records.push({
+                    handle: entry,
+                    name: entry.name,
+                    path: relativePath,
+                    dir: normalizeRelativePath(relativeDir),
+                    baseName: parts.baseName,
+                    ext: parts.ext,
+                });
+            }
+
+            return records;
+        }
+
+        function groupRecordsByBaseName(records) {
+            const groups = new Map();
+            for (const record of records) {
+                const key = record.baseName.toLowerCase();
+                if (!groups.has(key)) {
+                    groups.set(key, []);
+                }
+                groups.get(key).push(record);
+            }
+            return groups;
+        }
+
+        function isStrongLabelRecord(record, imageExtensionsSet, labelExtensionsSet) {
+            if (!labelExtensionsSet.has(record.ext)) {
+                return false;
+            }
+
+            if (!imageExtensionsSet.has(record.ext)) {
+                return true;
+            }
+
+            return hasDirectoryRole(record.dir, LABEL_DIRECTORY_NAMES) || hasMaskLabelSuffix(record.baseName);
+        }
+
+        function isAmbiguousOverlapRecord(record, imageExtensionsSet, labelExtensionsSet) {
+            return imageExtensionsSet.has(record.ext)
+                && labelExtensionsSet.has(record.ext)
+                && !isStrongLabelRecord(record, imageExtensionsSet, labelExtensionsSet);
+        }
+
+        function shouldUseAsImageRecord(record, imageExtensionsSet, labelExtensionsSet, recordsByBaseName) {
+            if (!imageExtensionsSet.has(record.ext)) {
+                return false;
+            }
+
+            if (isStrongLabelRecord(record, imageExtensionsSet, labelExtensionsSet)) {
+                return false;
+            }
+
+            if (!isAmbiguousOverlapRecord(record, imageExtensionsSet, labelExtensionsSet)) {
+                return true;
+            }
+
+            const sameBaseRecords = recordsByBaseName.get(record.baseName.toLowerCase()) || [];
+            const hasImageTwin = sameBaseRecords.some(otherRecord => (
+                otherRecord !== record
+                && imageExtensionsSet.has(otherRecord.ext)
+                && !labelExtensionsSet.has(otherRecord.ext)
+                && recordsShareLogicalStem(record, LABEL_DIRECTORY_NAMES, otherRecord, IMAGE_DIRECTORY_NAMES)
+            ));
+
+            return !hasImageTwin;
+        }
+
+        function shouldUseAsLabelRecord(record, imageExtensionsSet, labelExtensionsSet, recordsByBaseName) {
+            if (!labelExtensionsSet.has(record.ext)) {
+                return false;
+            }
+
+            if (isStrongLabelRecord(record, imageExtensionsSet, labelExtensionsSet)) {
+                return true;
+            }
+
+            if (!isAmbiguousOverlapRecord(record, imageExtensionsSet, labelExtensionsSet)) {
+                return false;
+            }
+
+            const sameBaseRecords = recordsByBaseName.get(record.baseName.toLowerCase()) || [];
+            return sameBaseRecords.some(otherRecord => (
+                otherRecord !== record
+                && imageExtensionsSet.has(otherRecord.ext)
+                && recordsShareLogicalStem(record, LABEL_DIRECTORY_NAMES, otherRecord, IMAGE_DIRECTORY_NAMES)
+            ));
+        }
+
+        function addMapListValue(map, key, value) {
+            if (!key) {
+                return;
+            }
+
+            if (!map.has(key)) {
+                map.set(key, []);
+            }
+            map.get(key).push(value);
+        }
+
+        function getLabelMatchKeys(record) {
+            const keys = new Set(getRecordMatchKeys(record, LABEL_DIRECTORY_NAMES));
+            const strippedBaseName = stripMaskSuffix(record.baseName);
+            if (strippedBaseName !== record.baseName) {
+                getRecordMatchKeys(record, LABEL_DIRECTORY_NAMES, strippedBaseName).forEach(key => keys.add(key));
+            }
+            return Array.from(keys);
+        }
+
+        function getOutputRelativeDir(record, roleNames) {
+            const segments = splitRelativePath(record.path);
+            segments.pop();
+            if (segments.length > 0 && roleNames.has(segments[0].toLowerCase())) {
+                segments.shift();
+            }
+            return segments.join('/');
+        }
+
+        function scoreLabelMatch(imageRecord, labelRecord, imageExtensionsSet) {
+            if (imageRecord.path === labelRecord.path) {
+                return Number.NEGATIVE_INFINITY;
+            }
+
+            let score = 0;
+            const strippedLabelBaseName = stripMaskSuffix(labelRecord.baseName);
+            const imageStem = normalizeMatchKey(getStemPath(imageRecord));
+            const imageRoleStem = normalizeMatchKey(stripLeadingRoleDirectory(getStemPath(imageRecord), IMAGE_DIRECTORY_NAMES));
+            const labelStem = normalizeMatchKey(getStemPath(labelRecord, strippedLabelBaseName));
+            const labelRoleStem = normalizeMatchKey(stripLeadingRoleDirectory(getStemPath(labelRecord, strippedLabelBaseName), LABEL_DIRECTORY_NAMES));
+
+            if (imageRoleStem === labelRoleStem) {
+                score += 120;
+            } else if (imageStem === labelStem) {
+                score += 90;
+            } else if (imageRecord.baseName.toLowerCase() === strippedLabelBaseName.toLowerCase()) {
+                score += 30;
+            }
+
+            if (imageRecord.dir === labelRecord.dir) {
+                score += 15;
+            }
+            if (hasDirectoryRole(labelRecord.dir, LABEL_DIRECTORY_NAMES)) {
+                score += 25;
+            }
+            if (hasDirectoryRole(imageRecord.dir, IMAGE_DIRECTORY_NAMES)) {
+                score += 5;
+            }
+            if (hasMaskLabelSuffix(labelRecord.baseName)) {
+                score += 20;
+            }
+            if (!imageExtensionsSet.has(labelRecord.ext)) {
+                score += 25;
+            } else if (hasDirectoryRole(labelRecord.dir, LABEL_DIRECTORY_NAMES) || hasMaskLabelSuffix(labelRecord.baseName)) {
+                score += 15;
+            } else {
+                score -= 20;
+            }
+
+            return score;
+        }
+
         async function getFilePairs(sourceDir, imageExts, labelExts, enableLog = true) {
-            const imageExtensionsSet = new Set(imageExts.map(ext => ext.toLowerCase()));
-            const labelExtensionsSet = new Set(labelExts.map(ext => ext.toLowerCase()));
-            const imageFiles = new Map();
+            const imageExtensionsSet = new Set(imageExts);
+            const labelExtensionsSet = new Set(labelExts);
+            const records = await collectFileRecords(sourceDir);
+            const recordsByBaseName = groupRecordsByBaseName(records);
+            const imageRecords = records
+                .filter(record => shouldUseAsImageRecord(record, imageExtensionsSet, labelExtensionsSet, recordsByBaseName))
+                .sort((left, right) => naturalCompare(left.path, right.path));
+            const labelRecords = records
+                .filter(record => shouldUseAsLabelRecord(record, imageExtensionsSet, labelExtensionsSet, recordsByBaseName))
+                .sort((left, right) => naturalCompare(left.path, right.path));
 
-            for await (const entry of sourceDir.values()) {
-                if (entry.kind !== 'file') {
-                    continue;
-                }
-                const nameParts = entry.name.split('.');
-                if (nameParts.length < 2) {
-                    continue;
-                }
-                const ext = nameParts.pop().toLowerCase();
-                const baseName = nameParts.join('.');
-                if (imageExtensionsSet.has(ext)) {
-                    imageFiles.set(baseName, { image: entry, label: null });
-                }
+            const labelIndex = new Map();
+            for (const labelRecord of labelRecords) {
+                getLabelMatchKeys(labelRecord).forEach(key => addMapListValue(labelIndex, key, labelRecord));
             }
 
-            for await (const entry of sourceDir.values()) {
-                if (entry.kind !== 'file') {
+            const pairs = [];
+            const unmatchedImages = [];
+            const usedLabelPaths = new Set();
+
+            for (const imageRecord of imageRecords) {
+                const candidates = new Set();
+                getRecordMatchKeys(imageRecord, IMAGE_DIRECTORY_NAMES).forEach(key => {
+                    (labelIndex.get(key) || []).forEach(labelRecord => candidates.add(labelRecord));
+                });
+
+                const rankedCandidates = Array.from(candidates)
+                    .filter(labelRecord => !usedLabelPaths.has(labelRecord.path))
+                    .map(labelRecord => ({
+                        labelRecord,
+                        score: scoreLabelMatch(imageRecord, labelRecord, imageExtensionsSet),
+                    }))
+                    .filter(candidate => candidate.score > 0)
+                    .sort((left, right) => (
+                        right.score - left.score
+                        || naturalCompare(left.labelRecord.path, right.labelRecord.path)
+                    ));
+
+                if (rankedCandidates.length === 0) {
+                    unmatchedImages.push(imageRecord);
                     continue;
                 }
-                const nameParts = entry.name.split('.');
-                if (nameParts.length < 2) {
-                    continue;
-                }
-                const ext = nameParts.pop().toLowerCase();
-                const baseName = nameParts.join('.');
-                if (labelExtensionsSet.has(ext) && imageFiles.has(baseName)) {
-                    const pair = imageFiles.get(baseName);
-                    pair.label = entry;
-                    imageFiles.set(baseName, pair);
-                }
+
+                const labelRecord = rankedCandidates[0].labelRecord;
+                usedLabelPaths.add(labelRecord.path);
+                pairs.push({
+                    image: imageRecord.handle,
+                    label: labelRecord.handle,
+                    imagePath: imageRecord.path,
+                    labelPath: labelRecord.path,
+                    imageRelativeDir: getOutputRelativeDir(imageRecord, IMAGE_DIRECTORY_NAMES),
+                    labelRelativeDir: getOutputRelativeDir(labelRecord, LABEL_DIRECTORY_NAMES),
+                    needsSeparatedOutput: imageExtensionsSet.has(labelRecord.ext)
+                        || hasDirectoryRole(imageRecord.dir, IMAGE_DIRECTORY_NAMES)
+                        || hasDirectoryRole(labelRecord.dir, LABEL_DIRECTORY_NAMES)
+                        || imageRecord.name.toLowerCase() === labelRecord.name.toLowerCase(),
+                });
             }
 
-            const sortedPairs = Array.from(imageFiles.values())
-                .filter(pair => pair.label)
-                .sort((left, right) => naturalCompare(left.image.name, right.image.name));
+            const sortedPairs = pairs.sort((left, right) => naturalCompare(left.imagePath, right.imagePath));
 
             if (enableLog) {
-                Array.from(imageFiles.values())
-                    .filter(pair => !pair.label)
-                    .forEach(pair => log(`警告: 未找到图像 ${pair.image.name} 的标注文件`));
+                const maskPairs = sortedPairs.filter(pair => pair.label.name.toLowerCase().endsWith('.png')).length;
+                log(`扫描到 ${imageRecords.length} 个图像候选、${labelRecords.length} 个标注候选，成功匹配 ${sortedPairs.length} 组文件`);
+                if (maskPairs > 0) {
+                    log(`已识别 ${maskPairs} 组 mask PNG 标注；同名 PNG 会输出到 labels 子目录，避免覆盖图像`);
+                }
+                if (labelExtensionsSet.has('png')) {
+                    log('提示: mask PNG 可放在 labels/masks 等目录中；若与图像同目录，建议使用 *_mask.png、*_label.png 或 *_seg.png 命名。完全同目录且同名的 image.png/mask.png 无法自动区分。');
+                }
+                unmatchedImages.slice(0, 20).forEach(imageRecord => log(`警告: 未找到图像 ${imageRecord.path} 的标注文件`));
+                if (unmatchedImages.length > 20) {
+                    log(`还有 ${unmatchedImages.length - 20} 个未匹配图像未显示`);
+                }
             }
 
             return sortedPairs;
@@ -876,6 +1179,21 @@
             }
         }
 
+        function shouldUseSeparatedOutput(filePairs) {
+            return filePairs.some(pair => (
+                pair.needsSeparatedOutput
+                || Boolean(pair.imageRelativeDir)
+                || Boolean(pair.labelRelativeDir)
+            ));
+        }
+
+        async function copyPairedFile(pair, imageDirectoryResolver, labelDirectoryResolver, preserveRelativeDirs) {
+            const imageDir = await imageDirectoryResolver(preserveRelativeDirs ? pair.imageRelativeDir : '');
+            const labelDir = await labelDirectoryResolver(preserveRelativeDirs ? pair.labelRelativeDir : '');
+            await copyFile(pair.image, imageDir, pair.image.name);
+            await copyFile(pair.label, labelDir, pair.label.name);
+        }
+
         async function copyClassificationSample(sample, directoryResolver) {
             const targetDir = await directoryResolver(sample.relativeDir);
             await copyFile(sample.file, targetDir, sample.fileName);
@@ -1013,7 +1331,12 @@
                     let validImageDir = validDir;
                     let validLabelDir = validDir;
 
-                    if (useSubfolders) {
+                    const effectiveUseSubfolders = useSubfolders || shouldUseSeparatedOutput(filePairsToProcess);
+                    if (effectiveUseSubfolders && !useSubfolders) {
+                        log('检测到 mask PNG、images/labels 源目录或嵌套路径，已自动创建 images 和 labels 子文件夹以避免覆盖并保留结构。');
+                    }
+
+                    if (effectiveUseSubfolders) {
                         [trainImageDir, trainLabelDir, testImageDir, testLabelDir, validImageDir, validLabelDir] = await Promise.all([
                             ensureDirectoryExists(trainDir, 'images'),
                             ensureDirectoryExists(trainDir, 'labels'),
@@ -1027,25 +1350,28 @@
                     const totalFilesToCopy = trainCount + validCount + testCount;
                     const baseProgress = 30;
                     const reporter = createProgressReporter(baseProgress, 70, totalFilesToCopy, '个文件对');
+                    const trainImageResolver = createDirectoryResolver(trainImageDir);
+                    const trainLabelResolver = createDirectoryResolver(trainLabelDir);
+                    const validImageResolver = createDirectoryResolver(validImageDir);
+                    const validLabelResolver = createDirectoryResolver(validLabelDir);
+                    const testImageResolver = createDirectoryResolver(testImageDir);
+                    const testLabelResolver = createDirectoryResolver(testLabelDir);
 
                     reporter.begin(`正在复制训练集文件 (${trainCount} 个)...`);
                     await runWithConcurrency(trainFiles, COPY_CONCURRENCY, async pair => {
-                        await copyFile(pair.image, trainImageDir, pair.image.name);
-                        await copyFile(pair.label, trainLabelDir, pair.label.name);
+                        await copyPairedFile(pair, trainImageResolver, trainLabelResolver, effectiveUseSubfolders);
                         reporter.tick();
                     });
 
                     reporter.begin(`正在复制验证集文件 (${validCount} 个)...`);
                     await runWithConcurrency(validFiles, COPY_CONCURRENCY, async pair => {
-                        await copyFile(pair.image, validImageDir, pair.image.name);
-                        await copyFile(pair.label, validLabelDir, pair.label.name);
+                        await copyPairedFile(pair, validImageResolver, validLabelResolver, effectiveUseSubfolders);
                         reporter.tick();
                     });
 
                     reporter.begin(`正在复制测试集文件 (${testCount} 个)...`);
                     await runWithConcurrency(testFiles, COPY_CONCURRENCY, async pair => {
-                        await copyFile(pair.image, testImageDir, pair.image.name);
-                        await copyFile(pair.label, testLabelDir, pair.label.name);
+                        await copyPairedFile(pair, testImageResolver, testLabelResolver, effectiveUseSubfolders);
                         reporter.tick();
                     });
 
