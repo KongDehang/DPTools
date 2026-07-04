@@ -4,7 +4,7 @@ import hashlib
 from typing import Literal
 
 from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QImage, QKeyEvent, QMouseEvent, QPaintEvent, QPainter, QPen
+from PyQt6.QtGui import QColor, QFontMetrics, QImage, QKeyEvent, QMouseEvent, QPaintEvent, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
 from ..constants import CANVAS_BACKGROUND, CROSSHAIR_COLOR, HANDLE_SIZE
@@ -18,6 +18,8 @@ class AnnotationCanvas(QWidget):
     annotationChanged = pyqtSignal()
     selectionChanged = pyqtSignal(int)
     drawBoxRequested = pyqtSignal(int, int, int, int)
+    drawPolygonRequested = pyqtSignal(object)
+    panRequested = pyqtSignal(int, int)
     cursorPositionChanged = pyqtSignal(int, int)
     editOperationStarted = pyqtSignal()
 
@@ -35,9 +37,15 @@ class AnnotationCanvas(QWidget):
         self._selected_index = -1
         self._edit_mode = False
         self._draw_mode = False
+        self._draw_shape = "rectangle"
         self._cursor_image_pos: tuple[int, int] | None = None
         self._draft_start: tuple[int, int] | None = None
         self._draft_end: tuple[int, int] | None = None
+        self._draft_polygon_points: list[tuple[int, int]] = []
+        self._pending_polygon_point: tuple[int, int] | None = None
+        self._pending_pan_start: QPointF | None = None
+        self._last_pan_pos: QPointF | None = None
+        self._panning = False
         self._operation: dict[str, object] | None = None
         self._placeholder_size = QSize(960, 640)
         self._display_size = QSize(960, 640)
@@ -63,6 +71,11 @@ class AnnotationCanvas(QWidget):
         self._selected_index = -1
         self._draft_start = None
         self._draft_end = None
+        self._draft_polygon_points = []
+        self._pending_polygon_point = None
+        self._pending_pan_start = None
+        self._last_pan_pos = None
+        self._panning = False
         self._operation = None
         self._cursor_image_pos = None
         self._rebuild_display_image()
@@ -128,6 +141,20 @@ class AnnotationCanvas(QWidget):
         self._update_cursor()
         self.update()
 
+    def set_draw_shape(self, shape: str) -> None:
+        next_shape = "polygon" if str(shape).strip().lower() == "polygon" else "rectangle"
+        if next_shape == self._draw_shape:
+            return
+        self._draw_shape = next_shape
+        self._draft_start = None
+        self._draft_end = None
+        self._draft_polygon_points = []
+        self._pending_polygon_point = None
+        self._pending_pan_start = None
+        self._last_pan_pos = None
+        self._panning = False
+        self.update()
+
     def set_selected_index(self, index: int) -> None:
         self._selected_index = index if 0 <= index < len(self._boxes) else -1
         self.update()
@@ -135,6 +162,11 @@ class AnnotationCanvas(QWidget):
     def clear_interaction(self) -> None:
         self._draft_start = None
         self._draft_end = None
+        self._draft_polygon_points = []
+        self._pending_polygon_point = None
+        self._pending_pan_start = None
+        self._last_pan_pos = None
+        self._panning = False
         self._operation = None
         self._cursor_image_pos = None
         self.update()
@@ -147,10 +179,20 @@ class AnnotationCanvas(QWidget):
         if hasattr(window, "handle_key_press") and callable(getattr(window, "handle_key_press")):
             if window.handle_key_press(event):
                 return
+        if self._draw_mode and self._draw_shape == "polygon":
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._finish_draft_polygon()
+                return
+            if event.key() == Qt.Key.Key_Backspace and self._draft_polygon_points:
+                self._draft_polygon_points.pop()
+                if not self._draft_polygon_points:
+                    self._draft_end = None
+                self.update()
+                return
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._image is None or event.button() != Qt.MouseButton.LeftButton:
+        if self._image is None:
             super().mousePressEvent(event)
             return
 
@@ -160,6 +202,26 @@ class AnnotationCanvas(QWidget):
         self.cursorPositionChanged.emit(x, y)
 
         if self._draw_mode:
+            if self._draw_shape == "polygon":
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._pending_polygon_point = (x, y)
+                    self._pending_pan_start = event.position()
+                    self._last_pan_pos = event.position()
+                    self._panning = False
+                    self._draft_end = (x, y)
+                    self._selected_index = -1
+                    self.selectionChanged.emit(-1)
+                    self.update()
+                    return
+                if event.button() == Qt.MouseButton.RightButton:
+                    self._finish_draft_polygon()
+                    return
+                super().mousePressEvent(event)
+                return
+
+            if event.button() != Qt.MouseButton.LeftButton:
+                super().mousePressEvent(event)
+                return
             self._draft_start = (x, y)
             self._draft_end = (x, y)
             self._selected_index = -1
@@ -167,9 +229,16 @@ class AnnotationCanvas(QWidget):
             self.update()
             return
 
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+
         if not self._edit_mode:
             self._selected_index = -1
             self.selectionChanged.emit(-1)
+            self._pending_pan_start = event.position()
+            self._last_pan_pos = event.position()
+            self._panning = False
             self.update()
             return
 
@@ -179,6 +248,9 @@ class AnnotationCanvas(QWidget):
                 self._selected_index = -1
                 self.selectionChanged.emit(-1)
                 self.update()
+            self._pending_pan_start = event.position()
+            self._last_pan_pos = event.position()
+            self._panning = False
             return
 
         index, mode, handle = hit
@@ -196,6 +268,16 @@ class AnnotationCanvas(QWidget):
                 "offset_y": y - box.y1,
                 "width": box.width(),
                 "height": box.height(),
+                "origin_x": box.x1,
+                "origin_y": box.y1,
+                "points": self._boxes[index].polygon_points() if self._boxes[index].is_polygon else [],
+            }
+            self.editOperationStarted.emit()
+        elif mode == "vertex" and handle is not None:
+            self._operation = {
+                "type": "vertex",
+                "index": index,
+                "point_index": int(handle),
             }
             self.editOperationStarted.emit()
         elif mode == "resize" and handle is not None:
@@ -217,6 +299,16 @@ class AnnotationCanvas(QWidget):
         self._cursor_image_pos = (x, y)
         self.cursorPositionChanged.emit(x, y)
 
+        if self._maybe_pan(event.position()):
+            self._draft_end = (x, y)
+            self.update()
+            return
+
+        if self._draw_mode and self._draw_shape == "polygon" and self._draft_polygon_points:
+            self._draft_end = (x, y)
+            self.update()
+            return
+
         if self._draw_mode and self._draft_start is not None:
             self._draft_end = (x, y)
             self.update()
@@ -235,6 +327,21 @@ class AnnotationCanvas(QWidget):
             super().mouseReleaseEvent(event)
             return
 
+        if self._draw_mode and self._draw_shape == "polygon":
+            if self._panning:
+                self._finish_pan()
+                return
+            if self._pending_polygon_point is not None:
+                point = self._pending_polygon_point
+                if not self._draft_polygon_points or self._draft_polygon_points[-1] != point:
+                    self._draft_polygon_points.append(point)
+                self._draft_end = point
+                self._pending_polygon_point = None
+                self._pending_pan_start = None
+                self._last_pan_pos = None
+                self.update()
+            return
+
         if self._draw_mode and self._draft_start is not None and self._draft_end is not None:
             left, top = self._draft_start
             right, bottom = self._draft_end
@@ -249,18 +356,35 @@ class AnnotationCanvas(QWidget):
             return
 
         if self._edit_mode and self._operation is not None and self._selected_index != -1:
-            box = self._boxes[self._selected_index].ordered().clamp(self.image_width, self.image_height)
-            self._boxes[self._selected_index].x1 = box.x1
-            self._boxes[self._selected_index].y1 = box.y1
-            self._boxes[self._selected_index].x2 = box.x2
-            self._boxes[self._selected_index].y2 = box.y2
+            self._boxes[self._selected_index] = self._boxes[self._selected_index].clamp(
+                self.image_width,
+                self.image_height,
+            )
             self._operation = None
             self.annotationChanged.emit()
             self.update()
             return
 
+        if self._panning:
+            self._finish_pan()
+            return
+
+        self._pending_pan_start = None
+        self._last_pan_pos = None
         self._operation = None
         self.update()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._image is not None
+            and self._draw_mode
+            and self._draw_shape == "polygon"
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._finish_draft_polygon()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def leaveEvent(self, event) -> None:  # pragma: no cover - Qt interaction
         if self._operation is None:
@@ -282,6 +406,7 @@ class AnnotationCanvas(QWidget):
         self._paint_boxes(painter)
         self._paint_crosshair(painter)
         self._paint_draft_box(painter)
+        self._paint_draft_polygon(painter)
 
     @property
     def image_width(self) -> int:
@@ -321,7 +446,16 @@ class AnnotationCanvas(QWidget):
                 max(1.0, ordered.width() * self._scale),
                 max(1.0, ordered.height() * self._scale),
             )
-            painter.drawRect(rect)
+            if box.is_polygon:
+                polygon = QPolygonF(
+                    [QPointF(x * self._scale, y * self._scale) for x, y in box.polygon_points()]
+                )
+                painter.drawPolygon(polygon)
+                if selected:
+                    painter.setPen(QPen(QColor(255, 255, 255, 170), 1, Qt.PenStyle.DashLine))
+                    painter.drawRect(rect)
+            else:
+                painter.drawRect(rect)
 
             label_text = self._compose_label_text(box)
             if label_text:
@@ -342,7 +476,10 @@ class AnnotationCanvas(QWidget):
                 )
 
             if selected and self._edit_mode:
-                self._draw_handles(painter, ordered)
+                if box.is_polygon:
+                    self._draw_polygon_handles(painter, box)
+                else:
+                    self._draw_handles(painter, ordered)
 
     def _compose_label_text(self, box: Box) -> str:
         class_name = str(box.class_name).strip() or "未命名"
@@ -408,7 +545,12 @@ class AnnotationCanvas(QWidget):
         painter.drawLine(QPointF(0, screen_y), QPointF(self._display_size.width(), screen_y))
 
     def _paint_draft_box(self, painter: QPainter) -> None:
-        if not self._draw_mode or self._draft_start is None or self._draft_end is None:
+        if (
+            not self._draw_mode
+            or self._draw_shape != "rectangle"
+            or self._draft_start is None
+            or self._draft_end is None
+        ):
             return
         x1, y1 = self._draft_start
         x2, y2 = self._draft_end
@@ -421,6 +563,62 @@ class AnnotationCanvas(QWidget):
         painter.setPen(QPen(QColor(49, 196, 141), 2, Qt.PenStyle.DashLine))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rect)
+
+    def _paint_draft_polygon(self, painter: QPainter) -> None:
+        if not self._draw_mode or self._draw_shape != "polygon" or not self._draft_polygon_points:
+            return
+
+        color = QColor(49, 196, 141)
+        points = [QPointF(x * self._scale, y * self._scale) for x, y in self._draft_polygon_points]
+        if self._draft_end is not None and self._draft_end != self._draft_polygon_points[-1]:
+            points.append(QPointF(self._draft_end[0] * self._scale, self._draft_end[1] * self._scale))
+
+        painter.save()
+        painter.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if len(points) >= 2:
+            painter.drawPolyline(QPolygonF(points))
+        if len(self._draft_polygon_points) >= 3:
+            closed_points = [QPointF(x * self._scale, y * self._scale) for x, y in self._draft_polygon_points]
+            painter.setPen(QPen(QColor(255, 255, 255, 150), 1, Qt.PenStyle.DotLine))
+            painter.drawPolygon(QPolygonF(closed_points))
+
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.setBrush(color)
+        point_size = max(5.0, min(9.0, 7.0 * self._scale))
+        for point in points[: len(self._draft_polygon_points)]:
+            painter.drawEllipse(
+                QRectF(
+                    point.x() - point_size / 2,
+                    point.y() - point_size / 2,
+                    point_size,
+                    point_size,
+                )
+            )
+        painter.restore()
+
+    def _finish_draft_polygon(self) -> None:
+        if len(self._draft_polygon_points) >= 3:
+            points = list(self._draft_polygon_points)
+            self._draft_polygon_points = []
+            self._draft_end = None
+            self._pending_polygon_point = None
+            self._pending_pan_start = None
+            self._last_pan_pos = None
+            self._panning = False
+            self._operation = None
+            self.drawPolygonRequested.emit(points)
+            self.update()
+            return
+
+        self._draft_polygon_points = []
+        self._draft_end = None
+        self._pending_polygon_point = None
+        self._pending_pan_start = None
+        self._last_pan_pos = None
+        self._panning = False
+        self._operation = None
+        self.update()
 
     def _draw_handles(self, painter: QPainter, box: Box) -> None:
         points = [
@@ -441,10 +639,33 @@ class AnnotationCanvas(QWidget):
             )
             painter.drawRect(rect)
 
-    def _hit_test(self, x: int, y: int) -> tuple[int, str, HandleName | None] | None:
+    def _draw_polygon_handles(self, painter: QPainter, box: Box) -> None:
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.setBrush(QColor(255, 215, 0))
+        size = HANDLE_SIZE
+        for point_x, point_y in box.polygon_points():
+            rect = QRectF(
+                point_x * self._scale - size / 2,
+                point_y * self._scale - size / 2,
+                size,
+                size,
+            )
+            painter.drawEllipse(rect)
+
+    def _hit_test(self, x: int, y: int) -> tuple[int, str, object | None] | None:
         tolerance = max(5, int(round(8 / max(self._scale, 0.1))))
         for index in range(len(self._boxes) - 1, -1, -1):
-            box = self._boxes[index].ordered()
+            source_box = self._boxes[index]
+            box = source_box.ordered()
+            if source_box.is_polygon:
+                for point_index, (point_x, point_y) in enumerate(source_box.polygon_points()):
+                    if abs(x - point_x) <= tolerance and abs(y - point_y) <= tolerance:
+                        return index, "vertex", point_index
+                if self._point_in_polygon(x, y, source_box.polygon_points()):
+                    return index, "move", None
+                if box.x1 < x < box.x2 and box.y1 < y < box.y2:
+                    return index, "move", None
+                continue
             handles = {
                 "tl": (box.x1, box.y1),
                 "tr": (box.x2, box.y1),
@@ -475,10 +696,44 @@ class AnnotationCanvas(QWidget):
             max_y = max(0, self.image_height - height)
             new_x1 = self._clamp(x - offset_x, 0, max_x)
             new_y1 = self._clamp(y - offset_y, 0, max_y)
+            if self._boxes[index].is_polygon:
+                origin_x = int(self._operation.get("origin_x", new_x1))
+                origin_y = int(self._operation.get("origin_y", new_y1))
+                delta_x = new_x1 - origin_x
+                delta_y = new_y1 - origin_y
+                raw_points = self._operation.get("points", [])
+                if isinstance(raw_points, list) and raw_points:
+                    moved_points = [
+                        (int(px) + delta_x, int(py) + delta_y)
+                        for px, py in raw_points
+                    ]
+                    self._boxes[index] = Box.from_polygon(moved_points, self._boxes[index].class_name).clamp(
+                        self.image_width,
+                        self.image_height,
+                    )
+                return
+
             self._boxes[index].x1 = new_x1
             self._boxes[index].y1 = new_y1
             self._boxes[index].x2 = new_x1 + width
             self._boxes[index].y2 = new_y1 + height
+        elif op_type == "vertex":
+            point_index = int(self._operation.get("point_index", -1))
+            box = self._boxes[index]
+            if not box.is_polygon or point_index < 0 or point_index >= len(box.points):
+                return
+            points = box.polygon_points()
+            points[point_index] = (
+                self._clamp(x, 0, self.image_width - 1),
+                self._clamp(y, 0, self.image_height - 1),
+            )
+            try:
+                self._boxes[index] = Box.from_polygon(points, box.class_name).clamp(
+                    self.image_width,
+                    self.image_height,
+                )
+            except Exception:
+                return
         elif op_type == "resize":
             handle = str(self._operation.get("handle", ""))
             box = self._boxes[index]
@@ -494,6 +749,57 @@ class AnnotationCanvas(QWidget):
             elif handle == "br":
                 box.x2 = self._clamp(x, 0, self.image_width - 1)
                 box.y2 = self._clamp(y, 0, self.image_height - 1)
+
+    def _point_in_polygon(self, x: int, y: int, points: list[tuple[int, int]]) -> bool:
+        inside = False
+        count = len(points)
+        if count < 3:
+            return False
+        previous_x, previous_y = points[-1]
+        for current_x, current_y in points:
+            intersects = (current_y > y) != (previous_y > y)
+            if intersects:
+                denominator = previous_y - current_y
+                if abs(denominator) < 1e-6:
+                    previous_x, previous_y = current_x, current_y
+                    continue
+                slope_x = (previous_x - current_x) * (y - current_y) / denominator + current_x
+                if x < slope_x:
+                    inside = not inside
+            previous_x, previous_y = current_x, current_y
+        return inside
+
+    def _maybe_pan(self, position: QPointF) -> bool:
+        if self._pending_pan_start is None or self._last_pan_pos is None:
+            return False
+
+        if self._operation is not None:
+            return False
+
+        if not (self._draw_mode or self._edit_mode or self._selected_index == -1):
+            return False
+
+        dx_from_start = position.x() - self._pending_pan_start.x()
+        dy_from_start = position.y() - self._pending_pan_start.y()
+        if not self._panning and abs(dx_from_start) + abs(dy_from_start) < 5:
+            return False
+
+        dx = int(round(position.x() - self._last_pan_pos.x()))
+        dy = int(round(position.y() - self._last_pan_pos.y()))
+        self._last_pan_pos = position
+        self._panning = True
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        if dx or dy:
+            self.panRequested.emit(dx, dy)
+        return True
+
+    def _finish_pan(self) -> None:
+        self._pending_polygon_point = None
+        self._pending_pan_start = None
+        self._last_pan_pos = None
+        self._panning = False
+        self._update_cursor()
+        self.update()
 
     def _rebuild_display_image(self) -> None:
         if self._image is None:
@@ -522,6 +828,9 @@ class AnnotationCanvas(QWidget):
         return x, y
 
     def _update_cursor(self, position: QPointF | None = None) -> None:
+        if self._panning:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if self._draw_mode or self._edit_mode:
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:

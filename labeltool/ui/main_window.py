@@ -160,6 +160,8 @@ class AnnotationMainWindow(QMainWindow):
         self.current_image_index: int = -1
         self.current_zoom_scale = DEFAULT_ZOOM_SCALE
         self.draw_mode = False
+        raw_draw_shape = str(QSettings().value("ui/draw_shape", "rectangle") or "rectangle").strip().lower()
+        self.draw_shape = "polygon" if raw_draw_shape == "polygon" else "rectangle"
         self.edit_mode = False
         self._image_filter_text = ""
         self._pending_class_text = self._load_default_class_name()
@@ -192,6 +194,7 @@ class AnnotationMainWindow(QMainWindow):
         self._dataset_loading = False
         self._dataset_statistics_loading = False
         self._dataset_job_generation = 0
+        self._dataset_stats_job_generation = 0
         self._thumbnail_job_generation = 0
         self._thumbnail_visible_paths: list[Path] = []
         self._thumbnail_pending_paths: list[Path] = []
@@ -360,6 +363,8 @@ QMessageBox QPushButton {
 
         self.canvas = AnnotationCanvas(self)
         self.canvas.drawBoxRequested.connect(self.on_draw_box_requested)
+        self.canvas.drawPolygonRequested.connect(self.on_draw_polygon_requested)
+        self.canvas.panRequested.connect(self.on_canvas_pan_requested)
         self.canvas.annotationChanged.connect(self.on_canvas_annotation_changed)
         self.canvas.selectionChanged.connect(self.on_canvas_selection_changed)
         self.canvas.cursorPositionChanged.connect(self.on_canvas_cursor_changed)
@@ -1288,6 +1293,20 @@ QMessageBox QPushButton {
     def _build_annotation_tab(self) -> QWidget:
         page = QWidget(self)
 
+        draw_section = CollapsibleSection("绘制设置", expanded=True, parent=page)
+        self._style_section_header(draw_section, "#91d58b")
+        draw_form = QFormLayout()
+        draw_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        draw_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        self.draw_shape_combo = QComboBox()
+        self.draw_shape_combo.addItem("矩形", "rectangle")
+        self.draw_shape_combo.addItem("多边形", "polygon")
+        draw_index = self.draw_shape_combo.findData(self.draw_shape)
+        self.draw_shape_combo.setCurrentIndex(max(0, draw_index))
+        self.draw_shape_combo.currentIndexChanged.connect(self.on_draw_shape_changed)
+        draw_form.addRow("形状", self.draw_shape_combo)
+        draw_section.content_layout_ref().addLayout(draw_form)
+
         selection_section = CollapsibleSection("选中标注", expanded=True, parent=page)
         self._style_section_header(selection_section, "#8ecbff")
         self.selected_info_label = QLabel("未选中")
@@ -1323,6 +1342,7 @@ QMessageBox QPushButton {
         box_section.content_layout_ref().addWidget(self.box_list_widget, 1)
 
         return self._build_splitter_tab([
+            (draw_section, 1),
             (selection_section, 2),
             (box_section, 3),
         ])
@@ -1338,7 +1358,7 @@ QMessageBox QPushButton {
         export_form.setVerticalSpacing(8)
 
         self.export_format_combo = QComboBox()
-        for key in ("json", "xml", "txt"):
+        for key in ("json", "xml", "txt", "mask_png"):
             self.export_format_combo.addItem(FORMAT_LABELS[key], key)
         self.export_format_combo.setCurrentIndex(2)
         export_form.addRow("目标格式", self.export_format_combo)
@@ -1375,7 +1395,7 @@ QMessageBox QPushButton {
         export_buttons.addWidget(self.export_batch_button)
         export_section.content_layout_ref().addLayout(export_buttons)
 
-        self.export_path_hint_label = QLabel("将以当前图片同名文件输出到对应格式。")
+        self.export_path_hint_label = QLabel("优先输出到标签目录；Mask PNG 将输出单通道语义索引图。")
         self.export_path_hint_label.setObjectName("mutedLabel")
         self.export_path_hint_label.setWordWrap(True)
         export_section.content_layout_ref().addWidget(self.export_path_hint_label)
@@ -1557,6 +1577,7 @@ QMessageBox QPushButton {
         self.autosave.set_enabled(self._autosave_enabled_pref)
         self.action_autosave.setChecked(self._autosave_enabled_pref)
         self.canvas.editOperationStarted.connect(self.on_canvas_edit_operation_started)
+        self.canvas.set_draw_shape(self.draw_shape)
         self.on_autosave_interval_changed(self.autosave_interval_spin.value())
         self._apply_canvas_label_visual_settings()
         self.status_autosave_label.setText("自动保存 开" if self.autosave.enabled else "自动保存 关")
@@ -1614,6 +1635,18 @@ QMessageBox QPushButton {
                 parts.append("名称")
             text = "标签文本显示：" + (" + ".join(parts) if parts else "关闭")
             self._set_status_message(text, timeout_ms=1400)
+
+    def on_draw_shape_changed(self) -> None:
+        if not hasattr(self, "draw_shape_combo"):
+            return
+        shape = str(self.draw_shape_combo.currentData() or "rectangle")
+        self.draw_shape = "polygon" if shape == "polygon" else "rectangle"
+        self.canvas.set_draw_shape(self.draw_shape)
+        QSettings().setValue("ui/draw_shape", self.draw_shape)
+        self._update_mode_widgets()
+        self._update_status_bar_values()
+        label = "多边形" if self.draw_shape == "polygon" else "矩形"
+        self._set_status_message(f"绘制形状：{label}", timeout_ms=1400)
 
     def eventFilter(self, a0, a1) -> bool:
         if a0 == self.scroll_area.viewport() and isinstance(a1, QWheelEvent):
@@ -1772,10 +1805,12 @@ QMessageBox QPushButton {
         self._pending_dataset_root = root
         self._pending_dataset_preferred_path = preferred_path
         self._dataset_loading = True
+        self._cancel_dataset_statistics_loading()
+        self._cancel_thumbnail_loading()
         self._dataset_statistics_loading = True
         self._set_loaded_state(False)
-        self._set_statistics_loading_state("正在统计数据...")
-        self._set_status_message(f"正在加载数据集: {root}")
+        self._set_statistics_loading_state("等待统计数据...")
+        self._set_status_message(f"正在扫描数据集: {root}")
 
         worker = DatasetScanWorker(root, dict(self.class_manager.id_to_name))
         thread = QThread(self)
@@ -1820,6 +1855,7 @@ QMessageBox QPushButton {
         self.current_image_index = index
         self.current_zoom_scale = self._clamp_zoom(self.current_zoom_scale)
         self.canvas.set_document(qimage, self.current_document.boxes, self.current_zoom_scale)
+        self.canvas.set_draw_shape(self.draw_shape)
         self.canvas.set_modes(edit_mode=self.edit_mode, draw_mode=self.draw_mode)
         self.canvas.set_selected_index(-1)
         self.autosave.clear()
@@ -1872,8 +1908,20 @@ QMessageBox QPushButton {
             class_id = source_class_id_to_target_id.get(int(source_class_id))
             if class_id is None:
                 continue
+            if box.is_polygon:
+                coords: list[str] = []
+                for x, y in box.polygon_points():
+                    coords.append(f"{max(0.0, min(1.0, x / max(1.0, float(width)))):.6f}")
+                    coords.append(f"{max(0.0, min(1.0, y / max(1.0, float(height)))):.6f}")
+                if len(coords) >= 6:
+                    lines.append(f"{int(class_id)} {' '.join(coords)}")
+                continue
             cx, cy, bw, bh = box.normalized(width, height)
-            lines.append(f"{int(class_id)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            lines.append(
+                f"{int(class_id)} "
+                f"{max(0.0, min(1.0, cx)):.6f} {max(0.0, min(1.0, cy)):.6f} "
+                f"{max(0.0, min(1.0, bw)):.6f} {max(0.0, min(1.0, bh)):.6f}"
+            )
         label_path.parent.mkdir(parents=True, exist_ok=True)
         label_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -3715,6 +3763,14 @@ QMessageBox QPushButton {
     def on_canvas_cursor_changed(self, x: int, y: int) -> None:
         self.status_cursor_label.setText(f"坐标 {x}, {y}" if x >= 0 and y >= 0 else "坐标 --")
 
+    def on_canvas_pan_requested(self, dx: int, dy: int) -> None:
+        horizontal = self.scroll_area.horizontalScrollBar()
+        vertical = self.scroll_area.verticalScrollBar()
+        if horizontal is not None:
+            horizontal.setValue(horizontal.value() - int(dx))
+        if vertical is not None:
+            vertical.setValue(vertical.value() - int(dy))
+
     def on_draw_box_requested(self, x1: int, y1: int, x2: int, y2: int) -> None:
         default_name = self.box_class_combo.currentText().strip() or self._pending_class_text
         class_names = [name for _, name in self.class_manager.sorted_items()]
@@ -3740,6 +3796,53 @@ QMessageBox QPushButton {
         self._mark_document_dirty()
         self._refresh_all_views()
         self._set_status_message(f"已创建标注 {class_name}")
+
+    def on_draw_polygon_requested(self, points: object) -> None:
+        if self.current_document is None:
+            return
+
+        point_list: list[tuple[int, int]] = []
+        if isinstance(points, list):
+            for raw_point in points:
+                try:
+                    x, y = raw_point
+                    point_list.append((int(x), int(y)))
+                except Exception:
+                    continue
+        if len(point_list) < 3:
+            self._set_status_message("多边形至少需要 3 个点")
+            return
+
+        default_name = self.box_class_combo.currentText().strip() or self._pending_class_text
+        class_names = [name for _, name in self.class_manager.sorted_items()]
+        text, ok = ClassSelectorDialog.get_class_name(
+            self,
+            class_names,
+            default_text=default_name,
+            title="新建多边形标注",
+            prompt="选择或输入类别名称：",
+        )
+        if not ok:
+            return
+
+        class_name = self.class_manager.resolve_label_token(text)
+        self.history.begin(self.current_document.boxes, self.canvas.selected_index, self.class_manager)
+        try:
+            new_polygon = Box.from_polygon(point_list, class_name).clamp(*self.current_document.image_size)
+        except Exception:
+            self.history.clear_pending()
+            self._set_status_message("多边形创建失败")
+            return
+
+        self.current_document.boxes.append(new_polygon)
+        self.class_manager.sync_to_yaml()
+        next_index = len(self.current_document.boxes) - 1
+        self.canvas.set_selected_index(next_index)
+        self._set_selected_index(next_index, sync_canvas=False)
+        self.history.commit(self.current_document.boxes, self.canvas.selected_index, self.class_manager)
+        self._mark_document_dirty()
+        self._refresh_all_views()
+        self._set_status_message(f"已创建多边形标注 {class_name}")
 
     def rename_selected_box_class(self) -> bool:
         index = self.canvas.selected_index
@@ -3941,7 +4044,7 @@ QMessageBox QPushButton {
     def _on_dataset_scan_progress(self, job_id: int, current: int, total: int) -> None:
         if job_id != self._dataset_job_generation:
             return
-        self._set_status_message(f"正在加载数据集... {current}/{total}")
+        self._set_status_message(f"正在扫描数据集... {current}/{total}")
 
     def _on_dataset_scan_finished(self, job_id: int, result: DatasetScanResult) -> None:
         if job_id != self._dataset_job_generation:
@@ -3966,9 +4069,6 @@ QMessageBox QPushButton {
         self._refresh_project_info()
         self._refresh_class_widgets()
         self._refresh_image_list()
-        self._refresh_thumbnail_list()
-
-        self._start_dataset_statistics_loading(job_id, result)
 
         if self.dataset_service.image_paths:
             if self._pending_dataset_preferred_path is not None and self._pending_dataset_preferred_path in self._image_index_map:
@@ -3978,10 +4078,13 @@ QMessageBox QPushButton {
         else:
             self._clear_document()
 
+        self._refresh_thumbnail_list()
+        self._start_dataset_statistics_loading(result)
+
         self._pending_dataset_root = None
         self._pending_dataset_preferred_path = None
         self._update_status_bar_values()
-        self._set_status_message(f"数据集加载完成，共 {self.dataset_service.image_count()} 张图片")
+        self._set_status_message(f"数据集已就绪，共 {self.dataset_service.image_count()} 张图片；统计后台进行中")
 
     def _on_dataset_scan_failed(self, job_id: int, message: str) -> None:
         if job_id != self._dataset_job_generation:
@@ -3994,8 +4097,15 @@ QMessageBox QPushButton {
         self._set_statistics_loading_state("数据加载失败")
         self._set_status_message(f"数据集加载失败：{message}")
 
-    def _start_dataset_statistics_loading(self, job_id: int, result: DatasetScanResult) -> None:
+    def _start_dataset_statistics_loading(self, result: DatasetScanResult) -> None:
         self._cancel_dataset_statistics_loading()
+        if not result.image_paths:
+            self._dataset_statistics_loading = False
+            self._set_statistics_loading_state("暂无统计数据")
+            return
+
+        self._dataset_stats_job_generation += 1
+        job_id = self._dataset_stats_job_generation
         self._dataset_statistics_loading = True
         self._set_statistics_loading_state("正在统计数据...")
 
@@ -4006,7 +4116,7 @@ QMessageBox QPushButton {
         worker.progressChanged.connect(
             lambda current, total, job=job_id: self._on_dataset_statistics_progress(job, current, total)
         )
-        worker.finished.connect(lambda statistics, job=job_id: self._on_dataset_statistics_finished(job, statistics))
+        worker.finished.connect(lambda stats, job=job_id: self._on_dataset_statistics_finished(job, stats))
         worker.failed.connect(lambda message, job=job_id: self._on_dataset_statistics_failed(job, message))
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -4018,19 +4128,28 @@ QMessageBox QPushButton {
 
     def _cancel_dataset_statistics_loading(self) -> None:
         worker = self._dataset_statistics_worker
+        thread = self._dataset_statistics_thread
         if worker is not None:
             try:
                 worker.stop()
             except Exception:
                 pass
+        if thread is not None and thread.isRunning():
+            thread.quit()
+        self._dataset_statistics_worker = None
+        self._dataset_statistics_thread = None
+        self._dataset_statistics_loading = False
 
     def _on_dataset_statistics_progress(self, job_id: int, current: int, total: int) -> None:
-        if job_id != self._dataset_job_generation:
+        if job_id != self._dataset_stats_job_generation:
             return
-        self._set_status_message(f"正在统计数据... {current}/{total}")
+        if self._is_statistics_panel_visible():
+            self.status_message_label.setText(f"正在统计标注... {current}/{total}")
 
     def _on_dataset_statistics_finished(self, job_id: int, result: DatasetStatisticsResult) -> None:
-        if job_id != self._dataset_job_generation:
+        if job_id != self._dataset_stats_job_generation:
+            return
+        if self.dataset_service.root_dir is None or Path(result.root_dir) != self.dataset_service.root_dir:
             return
 
         self._dataset_statistics_loading = False
@@ -4038,15 +4157,18 @@ QMessageBox QPushButton {
         self._dataset_statistics_thread = None
         self._store_dataset_statistics_baseline(result)
         self._update_dataset_statistics_widget(force=True)
+        self._set_status_message(
+            f"统计完成：{result.annotated_images}/{result.total_images} 张有标注，{result.total_boxes} 个标注"
+        )
 
     def _on_dataset_statistics_failed(self, job_id: int, message: str) -> None:
-        if job_id != self._dataset_job_generation:
+        if job_id != self._dataset_stats_job_generation:
             return
-
         self._dataset_statistics_loading = False
         self._dataset_statistics_worker = None
         self._dataset_statistics_thread = None
-        self._set_status_message(f"数据统计失败：{message}")
+        self._set_statistics_loading_state("统计失败")
+        self._set_status_message(f"统计失败：{message}")
 
     def _sync_history_actions(self) -> None:
         has_document = self.current_document is not None
@@ -4223,7 +4345,15 @@ QMessageBox QPushButton {
         max_y = max(0, self.current_document.image_height - height)
         new_x1 = max(0, min(max_x, box.x1 + int(dx)))
         new_y1 = max(0, min(max_y, box.y1 + int(dy)))
-        self.current_document.boxes[index] = Box(new_x1, new_y1, new_x1 + width, new_y1 + height, box.class_name)
+        if self.current_document.boxes[index].is_polygon:
+            self.current_document.boxes[index] = self.current_document.boxes[index].moved(
+                new_x1 - box.x1,
+                new_y1 - box.y1,
+                self.current_document.image_width,
+                self.current_document.image_height,
+            )
+        else:
+            self.current_document.boxes[index] = Box(new_x1, new_y1, new_x1 + width, new_y1 + height, box.class_name)
 
         self.history.commit(self.current_document.boxes, index, self.class_manager)
         self._mark_document_dirty()
@@ -4281,13 +4411,56 @@ QMessageBox QPushButton {
         if self.current_document is None:
             return
         target_format = str(self.export_format_combo.currentData() or "txt")
-        target_path = self.annotation_io.default_export_path(self.current_document.image_path, target_format)
-        if (
-            self.current_document.label_path is not None
-            and self.current_document.label_path.suffix.lower() == target_path.suffix.lower()
-        ):
-            target_path = self.current_document.label_path
-        self._save_to_path(target_path, adopt_if_new=self.current_document.label_path is None, show_message=True)
+        target_path = self._build_annotation_export_path(
+            self.current_document.image_path,
+            target_format,
+            label_path=self.current_document.label_path,
+        )
+        adopt = self.current_document.label_path is None and target_format != "mask_png"
+        self._save_to_path(target_path, adopt_if_new=adopt, show_message=True)
+
+    def _build_annotation_export_path(
+        self,
+        image_path: Path,
+        target_format: str,
+        *,
+        target_dir: Path | None = None,
+        label_path: Path | None = None,
+    ) -> Path:
+        root_dir = self.dataset_service.root_dir
+
+        if label_path is not None:
+            if target_dir is not None and root_dir is not None:
+                try:
+                    return self._with_annotation_format(target_dir / label_path.relative_to(root_dir), target_format)
+                except Exception:
+                    pass
+            return self._with_annotation_format(label_path, target_format)
+
+        if target_dir is not None and root_dir is not None:
+            try:
+                relative_path = image_path.relative_to(root_dir)
+            except Exception:
+                relative_path = Path(image_path.name)
+            label_relative = self._image_relative_to_label_relative(relative_path)
+            return self._with_annotation_format(target_dir / label_relative, target_format)
+
+        return self._with_annotation_format(image_path, target_format, from_image=True)
+
+    def _image_relative_to_label_relative(self, relative_path: Path) -> Path:
+        parts = list(relative_path.parts)
+        for index, part in enumerate(parts):
+            if part.lower() in {"image", "images", "img", "imgs"}:
+                parts[index] = "labels"
+                return Path(*parts)
+        return relative_path
+
+    def _with_annotation_format(self, path: Path, target_format: str, *, from_image: bool = False) -> Path:
+        if target_format == "mask_png":
+            if from_image:
+                return path.with_name(f"{path.stem}_mask.png")
+            return path.with_suffix(".png")
+        return path.with_suffix(FORMAT_SUFFIX[target_format])
 
     def _warm_class_mapping_from_dataset_statistics(self) -> None:
         for class_name in self._dataset_stats_baseline_counts:
@@ -4323,16 +4496,7 @@ QMessageBox QPushButton {
 
         scaled: list[Box] = []
         for box in boxes:
-            ordered = box.ordered()
-            scaled.append(
-                Box(
-                    int(round(ordered.x1 * sx)),
-                    int(round(ordered.y1 * sy)),
-                    int(round(ordered.x2 * sx)),
-                    int(round(ordered.y2 * sy)),
-                    box.class_name,
-                ).clamp(target_width, target_height)
-            )
+            scaled.append(box.transformed(sx, sy, width=target_width, height=target_height))
         return scaled
 
     def _resize_image_letterbox(
@@ -4377,7 +4541,6 @@ QMessageBox QPushButton {
             relative_path = Path(image_path.name)
 
         output_image_path = target_dir / relative_path
-        output_label_path = output_image_path.with_suffix(FORMAT_SUFFIX[target_format])
 
         try:
             data = np.fromfile(str(image_path), dtype=np.uint8)
@@ -4391,6 +4554,12 @@ QMessageBox QPushButton {
         source_height, source_width = source_image.shape[:2]
         target_width, target_height = target_size
         label_path = self.dataset_service.find_label_for_image(image_path)
+        output_label_path = self._build_annotation_export_path(
+            image_path,
+            target_format,
+            target_dir=target_dir,
+            label_path=label_path,
+        )
         boxes: list[Box] = []
         local_manager: ClassManager | None = None
         if label_path is not None:
@@ -4407,15 +4576,15 @@ QMessageBox QPushButton {
             resized_image, scale, pad_x, pad_y = self._resize_image_letterbox(source_image, target_size)
             scaled_boxes: list[Box] = []
             for box in boxes:
-                ordered = box.ordered()
                 scaled_boxes.append(
-                    Box(
-                        int(round(ordered.x1 * scale + pad_x)),
-                        int(round(ordered.y1 * scale + pad_y)),
-                        int(round(ordered.x2 * scale + pad_x)),
-                        int(round(ordered.y2 * scale + pad_y)),
-                        box.class_name,
-                    ).clamp(target_width, target_height)
+                    box.transformed(
+                        scale,
+                        scale,
+                        pad_x,
+                        pad_y,
+                        width=target_width,
+                        height=target_height,
+                    )
                 )
         else:
             interpolation = cv2.INTER_AREA if (target_width < source_width or target_height < source_height) else cv2.INTER_LINEAR
@@ -4597,12 +4766,12 @@ QMessageBox QPushButton {
         if root_dir is None:
             return False, True
 
-        try:
-            relative_path = image_path.relative_to(root_dir)
-        except Exception:
-            relative_path = Path(image_path.name)
-
-        output_path = (target_dir / relative_path).with_suffix(FORMAT_SUFFIX[target_format])
+        output_path = self._build_annotation_export_path(
+            image_path,
+            target_format,
+            target_dir=target_dir,
+            label_path=label_path,
+        )
         self.annotation_io.save_annotation(
             output_path,
             boxes,
@@ -5273,6 +5442,7 @@ QMessageBox QPushButton {
             self.canvas.setFocus()
 
     def _sync_mode_state(self) -> None:
+        self.canvas.set_draw_shape(self.draw_shape)
         self.canvas.set_modes(edit_mode=self.edit_mode, draw_mode=self.draw_mode)
         if self.current_document is not None:
             self.canvas.set_selected_index(-1)
@@ -5286,8 +5456,11 @@ QMessageBox QPushButton {
             self.action_edit.setChecked(self.edit_mode)
 
         self.btn_add_class.setEnabled(True)
-        self.action_draw.setText("取消绘制" if self.draw_mode else "新建标注")
+        shape_label = "多边形" if self.draw_shape == "polygon" else "标注"
+        self.action_draw.setText("取消绘制" if self.draw_mode else f"新建{shape_label}")
         self.action_edit.setText("取消编辑" if self.edit_mode else "编辑标注")
+        if hasattr(self, "draw_shape_combo"):
+            self.draw_shape_combo.setEnabled(True)
         self.btn_prev_image.setEnabled(self.dataset_service.image_count() > 0)
         self.btn_next_image.setEnabled(self.dataset_service.image_count() > 0)
         self.btn_open_dataset.setEnabled(True)
@@ -5409,8 +5582,9 @@ QMessageBox QPushButton {
         return status_bar
 
     def _update_status_bar_values(self) -> None:
+        draw_shape_label = "多边形" if self.draw_shape == "polygon" else "矩形"
         self.status_mode_label.setText(
-            f"模式 {'绘制' if self.draw_mode else '编辑' if self.edit_mode else '浏览'}"
+            f"模式 {'绘制' + draw_shape_label if self.draw_mode else '编辑' if self.edit_mode else '浏览'}"
         )
         self.status_autosave_label.setText(
             "自动保存 开" if self.autosave.enabled else "自动保存 关"
@@ -5543,4 +5717,6 @@ QMessageBox QPushButton {
         if not self._prepare_for_context_change():
             a0.ignore()
             return
+        self._cancel_dataset_statistics_loading()
+        self._cancel_thumbnail_loading()
         a0.accept()

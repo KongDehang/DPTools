@@ -122,7 +122,7 @@ class DatasetStatisticsWorker(QObject):
 
             for index, image_path in enumerate(dataset_service.image_paths):
                 if self._cancel_requested:
-                    break
+                    return
                 label_path = dataset_service.find_label_for_image(image_path)
                 if label_path is not None:
                     counts, box_count = annotation_io.count_annotation(label_path, class_id_to_name)
@@ -133,6 +133,9 @@ class DatasetStatisticsWorker(QObject):
                             class_counts[class_name] = class_counts.get(class_name, 0) + count
                 if index % 20 == 0 or index == total_images - 1:
                     self.progressChanged.emit(index + 1, total_images)
+
+            if self._cancel_requested:
+                return
 
             self.finished.emit(
                 DatasetStatisticsResult(

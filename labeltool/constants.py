@@ -18,12 +18,15 @@ IMAGE_EXTENSIONS = {
 }
 
 LABEL_EXTENSIONS = {".json", ".xml", ".txt"}
-ANNOTATION_FORMATS = ("json", "xml", "txt")
-FORMAT_SUFFIX = {"json": ".json", "xml": ".xml", "txt": ".txt"}
+MASK_LABEL_EXTENSIONS = {".png"}
+ALL_LABEL_EXTENSIONS = LABEL_EXTENSIONS | MASK_LABEL_EXTENSIONS
+ANNOTATION_FORMATS = ("json", "xml", "txt", "mask_png")
+FORMAT_SUFFIX = {"json": ".json", "xml": ".xml", "txt": ".txt", "mask_png": ".png"}
 FORMAT_LABELS = {
     "json": "JSON / LabelMe",
     "xml": "XML / Pascal VOC",
     "txt": "TXT / YOLO",
+    "mask_png": "Mask PNG / Semantic",
 }
 DEFAULT_AUTOSAVE_SECONDS = 2.5
 DEFAULT_ZOOM_SCALE = 1.0

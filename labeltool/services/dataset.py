@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from ..constants import IMAGE_EXTENSIONS, LABEL_EXTENSIONS
+from ..constants import IMAGE_EXTENSIONS, LABEL_EXTENSIONS, MASK_LABEL_EXTENSIONS
 from ..models import natural_sort_key
 
 
@@ -46,11 +46,12 @@ class DatasetService:
                     continue
 
                 suffix = path.suffix.lower()
-                if suffix in IMAGE_EXTENSIONS:
-                    self.image_paths.append(path)
-                elif suffix in LABEL_EXTENSIONS:
+                if suffix in LABEL_EXTENSIONS or self._is_mask_label_path(path):
                     self.label_paths.append(path)
-                    self._label_index[path.stem.lower()].append(path)
+                    for key in self._label_index_keys(path):
+                        self._label_index[key].append(path)
+                elif suffix in IMAGE_EXTENSIONS:
+                    self.image_paths.append(path)
 
         self.image_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
         self.label_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
@@ -72,7 +73,8 @@ class DatasetService:
         self.image_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
         self.label_paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
         for path in self.label_paths:
-            self._label_index[path.stem.lower()].append(path)
+            for key in self._label_index_keys(path):
+                self._label_index[key].append(path)
         for paths in self._label_index.values():
             paths.sort(key=lambda item: natural_sort_key(self._display_key(item)))
 
@@ -112,10 +114,25 @@ class DatasetService:
             score += 100
         if label_path.stem.lower() == image_path.stem.lower():
             score += 20
-        if label_path.parent.name.lower() in {"label", "labels", "annot", "annotation", "annotations", "ann"}:
+        if label_path.parent.name.lower() in {
+            "label",
+            "labels",
+            "annot",
+            "annotation",
+            "annotations",
+            "ann",
+            "mask",
+            "masks",
+            "seg",
+            "segs",
+            "segmentation",
+            "segmentations",
+        }:
             score += 10
-        if label_path.suffix.lower() in LABEL_EXTENSIONS:
+        if label_path.suffix.lower() in LABEL_EXTENSIONS or self._is_mask_label_path(label_path):
             score += 1
+        if label_path.stem.lower() == f"{image_path.stem.lower()}_mask":
+            score += 15
         return score, -len(label_path.parts), -len(label_path.name)
 
     def _display_key(self, path: Path) -> str:
@@ -138,3 +155,24 @@ class DatasetService:
             "dist",
         }
         return any(part in ignored_parts for part in path.parts)
+
+    def _label_index_keys(self, path: Path) -> tuple[str, ...]:
+        stem = path.stem.lower()
+        keys = [stem]
+        for suffix in ("_mask", "-mask"):
+            if stem.endswith(suffix) and len(stem) > len(suffix):
+                keys.append(stem[: -len(suffix)])
+        return tuple(dict.fromkeys(keys))
+
+    def _is_mask_label_path(self, path: Path) -> bool:
+        if path.suffix.lower() not in MASK_LABEL_EXTENSIONS:
+            return False
+
+        label_parts = {"label", "labels", "mask", "masks", "seg", "segs", "segmentation", "segmentations"}
+        image_parts = {"image", "images", "img", "imgs"}
+        lowered_parts = {part.lower() for part in path.parts}
+        if lowered_parts & label_parts:
+            return True
+        if lowered_parts & image_parts:
+            return False
+        return path.stem.lower().endswith(("_mask", "-mask"))
